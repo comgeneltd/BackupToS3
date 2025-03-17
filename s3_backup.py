@@ -731,10 +731,29 @@ class S3Manager:
         )
     
     def upload_file(self, local_file_path, s3_key):
-        """Upload a file to S3 Standard-IA storage."""
+        """Upload a file to S3 storage."""
         try:
+            # Extensive logging to understand configuration
+            logger.info(f"Config object attributes: {dir(self.config)}")
+            logger.info(f"Config dict representation: {vars(self.config)}")
+            
+            # Check config sections
+            logger.info("Config sections:")
+            for section in self.config.config.sections():
+                logger.info(f"Section {section}:")
+                for key, value in self.config.config[section].items():
+                    logger.info(f"  {key}: {value}")
+            
+            # Specific logging for storage class
+            logger.info(f"Raw storage class value: {getattr(self.config, 'storage_class', 'NOT FOUND')}")
+            
+            # Attempt to get storage class from config sections
+            config_storage_class = self.config.config['AWS'].get('storage_class', 'STANDARD_IA') if 'AWS' in self.config.config else 'STANDARD_IA'
+            logger.info(f"Storage class from config sections: {config_storage_class}")
+            
+            # Use the storage class from config sections
             extra_args = {
-                'StorageClass': self.config.storage_class
+                'StorageClass': config_storage_class.upper().replace(' ', '_')
             }
             
             self.s3_client.upload_file(
@@ -748,6 +767,10 @@ class S3Manager:
             return True
         except botocore.exceptions.ClientError as e:
             logger.error(f"Error uploading {local_file_path} to S3: {str(e)}")
+            logger.error(f"Detailed error: {e.response}")
+            return False
+        except Exception as e:
+            logger.error(f"Unexpected error uploading {local_file_path}: {str(e)}")
             return False
     
     def copy_object(self, source_key, dest_key):
