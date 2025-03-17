@@ -13,12 +13,12 @@ A tool for backing up Windows shares to S3 storage with local indexing.
 
 ## Documentation
 
-- [Prerequisites](PREREQUISITES.md)
-- [Installation & Usage Guide](USAGE.md)
+- [Prerequisites](docs/PREREQUISITES.md)
+- [Installation & Usage Guide](docs/USAGE.md)
 
 ## Quick Start
 
-See the [Usage Guide](USAGE.md) for detailed instructions.
+See the [Usage Guide](docs/USAGE.md) for detailed instructions.
 
 ## License
 
