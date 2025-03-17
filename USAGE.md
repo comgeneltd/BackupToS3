@@ -1,0 +1,248 @@
+# Usage Guide for S3 Windows Share Backup Tool
+
+## Quick Start
+
+```bash
+# Create a wrapper script for convenience
+cat > s3backup.sh << 'EOF'
+#!/bin/bash
+source "$PWD/s3backup_env/bin/activate"
+python "$PWD/s3_backup.py" "$@"
+deactivate
+EOF
+
+chmod +x s3backup.sh
+
+# Create a default configuration
+./s3backup.sh --create-config
+
+# Edit the configuration file
+nano config.ini
+
+# Test connection to shares
+./s3backup.sh --test-connection
+
+# Initialize the database and index
+./s3backup.sh --initialize
+
+# Run your first backup
+./s3backup.sh --run-now
+```
+
+## Configuration File Format
+
+The `config.ini` file contains several sections:
+
+### AWS Settings
+
+```ini
+[AWS]
+access_key = YOUR_AWS_ACCESS_KEY
+secret_key = YOUR_AWS_SECRET_KEY
+region = us-east-1
+bucket = your-bucket-name
+prefix = 
+```
+
+- `prefix` can be empty for no prefix, or set to a folder name like "backup/"
+
+### General Settings
+
+```ini
+[General]
+db_path = backup_index.db
+report_path = reports/
+scan_interval = 24
+thread_count = 4
+```
+
+- `scan_interval` is in hours
+- `thread_count` is the number of parallel uploads
+
+### Share Settings
+
+```ini
+[Shares]
+finance = 192.168.1.10,FinanceShare,username,password,WORKGROUP
+marketing = 192.168.1.10,MarketingShare,username,password,WORKGROUP
+guest_share = 192.168.1.10,PublicShare,guest,,
+```
+
+Format: `server_ip,share_name,username,password,domain/workgroup`
+
+- The key name (e.g., `finance`) becomes the folder prefix in S3
+- Use `guest` as username for guest/anonymous access
+- The domain/workgroup field can be empty for workgroups
+
+## Command Line Options
+
+### Basic Operations
+
+```bash
+# Create a default configuration file
+./s3backup.sh --create-config
+
+# Initialize the database and build initial index
+./s3backup.sh --initialize
+
+# Run backup immediately
+./s3backup.sh --run-now
+
+# Start scheduled backups
+./s3backup.sh --schedule
+```
+
+### Testing and Reporting
+
+```bash
+# Test connection to Windows shares
+./s3backup.sh --test-connection
+
+# List the backup index
+./s3backup.sh --list-index
+
+# Show only deleted files
+./s3backup.sh --list-index --show-deleted
+
+# Filter by share name
+./s3backup.sh --list-index --share finance
+
+# Export to CSV
+./s3backup.sh --list-index --export-csv index.csv
+
+# Generate a report of deleted files
+./s3backup.sh --deleted-report --report-path deleted_files.csv
+
+# Generate an AWS CLI script to delete files from S3
+./s3backup.sh --generate-delete-script --script-path delete_script.sh
+```
+
+## Encrypted Configuration
+
+To protect sensitive credentials in the config.ini file:
+
+```bash
+# Create a new encrypted config
+./s3backup.sh --create-config --encrypt-config
+
+# Encrypt an existing config
+./s3backup.sh --encrypt-config
+
+# Create a password file for unattended operations
+./s3backup.sh --create-password-file /path/to/.backup_password
+
+# Run with password file
+./s3backup.sh --run-now --password-file /path/to/.backup_password
+
+# Run with environment variable
+export BACKUP_PASSWORD=your_password
+./s3backup.sh --run-now --password-env BACKUP_PASSWORD
+```
+
+## Setting Up Scheduled Jobs
+
+### Using Cron
+
+```bash
+# Edit crontab
+crontab -e
+
+# Add a line to run daily at 2 AM
+0 2 * * * /path/to/s3backup.sh --run-now --password-file /path/to/.backup_password
+```
+
+### Using Systemd
+
+1. Create a service file:
+
+```bash
+sudo nano /etc/systemd/system/s3backup.service
+```
+
+2. Add the following content:
+
+```ini
+[Unit]
+Description=S3 Windows Share Backup
+After=network.target
+
+[Service]
+Type=simple
+User=username
+WorkingDirectory=/path/to/s3backup
+ExecStart=/path/to/s3backup.sh --run-now --password-file /path/to/.backup_password
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+```
+
+3. Create a timer file:
+
+```bash
+sudo nano /etc/systemd/system/s3backup.timer
+```
+
+4. Add the following content:
+
+```ini
+[Unit]
+Description=Run S3 Backup Daily
+
+[Timer]
+OnCalendar=*-*-* 02:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+5. Enable and start the timer:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable s3backup.timer
+sudo systemctl start s3backup.timer
+```
+
+## Troubleshooting
+
+### Connection Issues
+
+- **SMB Connection Failures**: Ensure Windows file sharing is enabled and ports 139/445 are open
+- **Authentication Issues**: Check credentials and workgroup/domain settings
+- **AWS Connection Failures**: Verify IAM permissions and network connectivity
+
+### Database Issues
+
+If you encounter database errors:
+
+```bash
+# Make a backup of the database
+cp backup_index.db backup_index.db.bak
+
+# Check database integrity
+sqlite3 backup_index.db "PRAGMA integrity_check;"
+
+# Repair if needed
+sqlite3 backup_index.db "VACUUM;"
+```
+
+### Log Files
+
+Check the log file for detailed information:
+
+```bash
+tail -100 s3_backup.log
+```
+
+## Understanding Backup Reports
+
+After each backup run, a report is generated in the `reports/` directory containing:
+
+- Files successfully uploaded
+- Failed uploads
+- Scan errors
+- File statistics
+
+The report format is CSV and can be opened in any spreadsheet application.
