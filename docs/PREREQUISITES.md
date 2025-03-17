@@ -44,7 +44,7 @@ See the [Usage Guide](USAGE.md) for detailed instructions on setting up and usin
 ```bash
 # Clone the repository
 git clone https://github.com/your-username/s3-windows-share-backup.git
-cd s3-windows-share-backup
+cd BackupToS3
 
 # Set up Python environment
 python3 -m venv s3backup_env
