@@ -17,7 +17,7 @@ chmod +x s3backup.sh
 ./s3backup.sh --create-config
 
 # Edit the configuration file
-nano config.ini
+vi config.ini
 
 # Test connection to shares
 ./s3backup.sh --test-connection
@@ -31,8 +31,6 @@ nano config.ini
 
 ## Configuration File Format
 
-The `config.ini` file contains several sections:
-
 ### AWS Settings
 
 ```ini
@@ -42,9 +40,11 @@ secret_key = YOUR_AWS_SECRET_KEY
 region = us-east-1
 bucket = your-bucket-name
 prefix = 
+storage_class = STANDARD_IA
 ```
 
 - `prefix` can be empty for no prefix, or set to a folder name like "backup/"
+- `storage_class` determines the S3 storage class (STANDARD_IA, DEEP_ARCHIVE, etc.)
 
 ### General Settings
 
@@ -90,6 +90,20 @@ Format: `server_ip,share_name,username,password,domain/workgroup`
 
 # Start scheduled backups
 ./s3backup.sh --schedule
+```
+
+### AWS Sync Operations
+
+```bash
+# Synchronize index with AWS S3 and Windows shares (no uploads)
+# Perfect when migrating from another backup solution
+./s3backup.sh --sync-index-with-aws
+
+# After syncing, review files that exist only in S3 
+./s3backup.sh --list-index --s3-only
+
+# Run a backup to upload only the missing files
+./s3backup.sh --run-now
 ```
 
 ### Testing and Reporting
@@ -156,7 +170,7 @@ crontab -e
 1. Create a service file:
 
 ```bash
-sudo nano /etc/systemd/system/s3backup.service
+sudo vi /etc/systemd/system/s3backup.service
 ```
 
 2. Add the following content:
@@ -180,7 +194,7 @@ WantedBy=multi-user.target
 3. Create a timer file:
 
 ```bash
-sudo nano /etc/systemd/system/s3backup.timer
+sudo vi /etc/systemd/system/s3backup.timer
 ```
 
 4. Add the following content:
@@ -204,6 +218,45 @@ sudo systemctl daemon-reload
 sudo systemctl enable s3backup.timer
 sudo systemctl start s3backup.timer
 ```
+
+## Migrating from Another Backup Solution
+
+If you're replacing an existing backup solution and already have files in S3:
+
+1. Configure the tool with your S3 bucket and shares
+
+```bash
+./s3backup.sh --create-config
+vi config.ini
+```
+
+2. Test connection to your shares
+
+```bash
+./s3backup.sh --test-connection
+```
+
+3. Synchronize the index with AWS S3 and your shares
+
+```bash
+./s3backup.sh --sync-index-with-aws
+```
+
+4. Review the synchronization report to see what matched and what needs to be uploaded
+
+5. Run a backup to upload only the files not already in S3
+
+```bash
+./s3backup.sh --run-now
+```
+
+6. Optionally, check files that exist only in S3 (potentially orphaned)
+
+```bash
+./s3backup.sh --list-index --s3-only
+```
+
+This migration workflow prevents re-uploading already backed up files, saving time and bandwidth.
 
 ## Troubleshooting
 
@@ -246,3 +299,8 @@ After each backup run, a report is generated in the `reports/` directory contain
 - File statistics
 
 The report format is CSV and can be opened in any spreadsheet application.
+
+When using the AWS sync functionality, a special sync report is also generated showing:
+- Files matched between S3 and shares
+- Files that exist only in S3
+- Files that need to be uploaded

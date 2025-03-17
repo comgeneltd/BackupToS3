@@ -129,6 +129,7 @@ class Config:
         self.aws_region = 'us-east-1'
         self.s3_bucket = ''
         self.s3_prefix = ''  # No prefix by default
+        self.storage_class = 'STANDARD_IA'  # Default storage class
         self.db_path = 'backup_index.db'
         self.report_path = 'reports/'
         self.shares = []
@@ -184,6 +185,7 @@ class Config:
                 self.aws_region = self.config['AWS'].get('region', 'us-east-1')
                 self.s3_bucket = self.config['AWS'].get('bucket', '')
                 self.s3_prefix = self.config['AWS'].get('prefix', '')
+                self.storage_class = self.config['AWS'].get('storage_class', 'STANDARD_IA')
             
             # General Settings
             if 'General' in self.config:
@@ -219,7 +221,8 @@ class Config:
             'secret_key': 'YOUR_SECRET_KEY',
             'region': 'us-east-1',
             'bucket': 'your-bucket-name',
-            'prefix': ''  # No prefix by default
+            'prefix': '',  # No prefix by default
+            'storage_class': 'STANDARD_IA'  # Default to Standard-IA storage
         }
         
         self.config['General'] = {
@@ -703,7 +706,7 @@ class S3Manager:
         """Upload a file to S3 Standard-IA storage."""
         try:
             extra_args = {
-                'StorageClass': 'STANDARD_IA'
+                'StorageClass': self.config.storage_class
             }
             
             self.s3_client.upload_file(
@@ -730,7 +733,7 @@ class S3Manager:
                 CopySource=copy_source,
                 Bucket=self.config.s3_bucket,
                 Key=dest_key,
-                StorageClass='STANDARD_IA'
+                StorageClass=self.config.storage_class
             )
             
             logger.info(f"Successfully copied s3://{self.config.s3_bucket}/{source_key} to s3://{self.config.s3_bucket}/{dest_key}")
@@ -1110,6 +1113,233 @@ class BackupManager:
         
         logger.info("Initial index building completed")
     
+    def sync_index_with_aws(self):
+        """
+        Synchronize index with both AWS S3 and Windows shares.
+        This builds a comprehensive index without uploading any files,
+        perfect for migrating from another backup solution.
+        """
+        logger.info("Synchronizing index with AWS S3 and Windows shares...")
+        
+        # Initialize counters
+        files_indexed_s3 = 0
+        files_indexed_shares = 0
+        files_matched = 0
+        s3_only_files = 0
+        
+        # Step 1: Index files from S3 first
+        logger.info("Indexing files from AWS S3...")
+        s3_files = {}  # Dictionary to track S3 files by path
+        
+        try:
+            for obj in self.s3_manager.list_objects():
+                s3_key = obj['Key']
+                
+                # If a prefix is configured, handle it properly
+                if self.config.s3_prefix:
+                    prefix = self.config.s3_prefix.rstrip('/')
+                    if not s3_key.startswith(prefix + '/'):
+                        continue
+                    # Extract share name and path from S3 key with prefix
+                    path_parts = s3_key[len(prefix) + 1:].split('/', 1)
+                else:
+                    # No prefix, so format is: share_name/path/to/file
+                    path_parts = s3_key.split('/', 1)
+                
+                if len(path_parts) != 2:
+                    continue
+                
+                share_name, file_path = path_parts
+                local_path = f"{share_name}:{file_path}"
+                
+                # Store in our tracking dictionary
+                s3_files[local_path] = {
+                    's3_path': s3_key,
+                    'size': obj['Size'],
+                    'last_modified': obj['LastModified'].isoformat()
+                }
+                
+                # Add to database with placeholder checksum
+                self.db_manager.add_file(
+                    local_path=local_path,
+                    s3_path=s3_key,
+                    size=obj['Size'],
+                    last_modified=obj['LastModified'].isoformat(),
+                    checksum="s3_indexed",  # Placeholder to be updated later if file exists
+                    previous_path=None,
+                    moved_in_s3=0
+                )
+                
+                files_indexed_s3 += 1
+                
+                if files_indexed_s3 % 1000 == 0:
+                    logger.info(f"Indexed {files_indexed_s3} files from S3 so far")
+        
+        except Exception as e:
+            logger.error(f"Error indexing S3: {str(e)}")
+        
+        logger.info(f"Indexed {files_indexed_s3} files from S3")
+        
+        # Step 2: Scan Windows shares to update checksums and match with S3 files
+        logger.info("Scanning Windows shares to match with S3 index...")
+        
+        # Dictionary to track files by share for reporting
+        share_stats = {}
+        
+        for share_config in self.config.shares:
+            share_name = share_config['local_name']
+            share_stats[share_name] = {
+                'total': 0,
+                'matched': 0,
+                'new': 0
+            }
+            
+            scanner = ShareScanner(share_config, self.db_manager)
+            try:
+                if not scanner.connect():
+                    logger.error(f"Failed to connect to share {share_config['name']}")
+                    continue
+                    
+                # Scan files in the share
+                for item in scanner.scan_directory():
+                    # Skip error records
+                    if 'error' in item and item['error']:
+                        continue
+                        
+                    # Process file info
+                    file_info = item
+                    files_indexed_shares += 1
+                    share_stats[share_name]['total'] += 1
+                    
+                    local_path = file_info['local_path']
+                    
+                    # Check if this file exists in S3
+                    if local_path in s3_files:
+                        # We have a match! Update the database with the checksum
+                        self.db_manager.add_file(
+                            local_path=local_path,
+                            s3_path=s3_files[local_path]['s3_path'],
+                            size=file_info['size'],
+                            last_modified=file_info['last_modified'].isoformat(),
+                            checksum=file_info['checksum'],
+                            previous_path=None,
+                            moved_in_s3=0
+                        )
+                        files_matched += 1
+                        share_stats[share_name]['matched'] += 1
+                    else:
+                        # File exists in share but not in S3
+                        # Generate S3 key for this file
+                        s3_key = self.s3_manager.generate_s3_key(file_info)
+                        
+                        # Add to database (will need to be uploaded later)
+                        self.db_manager.add_file(
+                            local_path=local_path,
+                            s3_path=s3_key,
+                            size=file_info['size'],
+                            last_modified=file_info['last_modified'].isoformat(),
+                            checksum=file_info['checksum'],
+                            previous_path=None,
+                            moved_in_s3=0
+                        )
+                        share_stats[share_name]['new'] += 1
+                    
+                    if files_indexed_shares % 1000 == 0:
+                        logger.info(f"Processed {files_indexed_shares} files from shares so far")
+            
+            except Exception as e:
+                logger.error(f"Error scanning share {share_name}: {str(e)}")
+            finally:
+                scanner.disconnect()
+        
+        # Step 3: Mark files that exist in S3 but not in shares as "s3_only"
+        # First, get all files with placeholder checksums
+        cursor = self.db_manager.conn.cursor()
+        cursor.execute("SELECT local_path FROM files WHERE checksum='s3_indexed'")
+        s3_only = cursor.fetchall()
+        
+        for row in s3_only:
+            local_path = row[0]
+            s3_only_files += 1
+            
+            # Update these with a special flag to indicate they're only in S3
+            cursor.execute(
+                "UPDATE files SET checksum='s3_only' WHERE local_path=?", 
+                (local_path,)
+            )
+        
+        self.db_manager.conn.commit()
+        
+        # Generate summary report
+        report = f"""
+AWS S3 and Windows Shares Synchronization Report
+===============================================
+Files indexed from AWS S3: {files_indexed_s3}
+Files indexed from Windows Shares: {files_indexed_shares}
+Files matched in both locations: {files_matched}
+Files existing only in S3: {s3_only_files}
+
+Share-by-Share Statistics:
+"""
+        
+        for share_name, stats in share_stats.items():
+            report += f"""
+{share_name}:
+  - Total files: {stats['total']}
+  - Matched with S3: {stats['matched']}
+  - New files (to be uploaded): {stats['new']}
+"""
+        
+        report += """
+Next Steps:
+----------
+1. Review the index with: python s3_backup.py --list-index
+2. Run a backup to upload new files: python s3_backup.py --run-now
+3. To see files that exist only in S3: python s3_backup.py --list-index --s3-only
+"""
+        
+        logger.info(report)
+        print(report)
+        
+        # Create a CSV report of the synchronization
+        report_file = os.path.join(
+            self.config.report_path, 
+            f'aws_sync_report_{datetime.datetime.now().strftime("%Y%m%d_%H%M%S")}.csv'
+        )
+        
+        try:
+            with open(report_file, 'w', newline='') as csvfile:
+                writer = csv.writer(csvfile)
+                writer.writerow(['Location', 'Share', 'Path', 'Size', 'Last Modified'])
+                
+                # Files only in S3
+                cursor.execute(
+                    "SELECT local_path, s3_path, size, last_modified FROM files WHERE checksum='s3_only'"
+                )
+                for row in cursor.fetchall():
+                    local_path, s3_path, size, last_modified = row
+                    share_name = local_path.split(':', 1)[0]
+                    file_path = local_path.split(':', 1)[1] if ':' in local_path else local_path
+                    writer.writerow(['S3 Only', share_name, file_path, size, last_modified])
+                
+                # New files that need to be uploaded
+                for share_name, stats in share_stats.items():
+                    if stats['new'] > 0:
+                        cursor.execute(
+                            "SELECT local_path, size, last_modified FROM files WHERE local_path LIKE ? AND checksum != 's3_only' AND checksum != 's3_indexed'",
+                            (f"{share_name}:%",)
+                        )
+                        for row in cursor.fetchall():
+                            local_path, size, last_modified = row
+                            file_path = local_path.split(':', 1)[1] if ':' in local_path else local_path
+                            writer.writerow(['To Upload', share_name, file_path, size, last_modified])
+            
+            logger.info(f"Detailed report saved to {report_file}")
+        except Exception as e:
+            logger.error(f"Error writing report: {str(e)}")
+        
+        logger.info("Index synchronization completed")
+    
     def upload_file_to_s3(self, file_info, s3_key):
         """Upload a file to S3 and update the index."""
         try:
@@ -1327,7 +1557,7 @@ def run_scheduled_backup(config):
         backup_manager.close()
 
 
-def list_index(config, show_deleted=False, share_filter=None, export_path=None, include_moved=True):
+def list_index(config, show_deleted=False, share_filter=None, export_path=None, include_moved=True, s3_only=False):
     """List the contents of the backup index."""
     logger.info("Listing backup index...")
     
@@ -1339,6 +1569,14 @@ def list_index(config, show_deleted=False, share_filter=None, export_path=None, 
         if show_deleted:
             files = db_manager.get_deleted_files()
             logger.info("Showing only deleted files")
+        elif s3_only:
+            cursor = db_manager.conn.cursor()
+            cursor.execute('''
+            SELECT id, local_path, s3_path, size, last_modified, checksum, is_deleted, last_backup, previous_path
+            FROM files WHERE checksum='s3_only'
+            ''')
+            files = cursor.fetchall()
+            logger.info("Showing files that exist only in S3")
         else:
             cursor = db_manager.conn.cursor()
             if include_moved:
@@ -1657,7 +1895,7 @@ def generate_s3_delete_script(config, output_path=None):
 
 def main():
     """Main entry point of the script."""
-    parser = argparse.ArgumentParser(description='S3 Deep Archive Backup Tool')
+    parser = argparse.ArgumentParser(description='S3 Windows Share Backup Tool')
     parser.add_argument('--create-password-file', help='Create a password file with the given path')
     parser.add_argument('--config', default=CONFIG_FILE, help='Path to configuration file')
     parser.add_argument('--initialize', action='store_true', help='Initialize the database and build initial index')
@@ -1678,6 +1916,10 @@ def main():
     parser.add_argument('--report-path', help='Path for deleted files report')
     parser.add_argument('--generate-delete-script', action='store_true', help='Generate a script with AWS CLI commands to delete files from S3')
     parser.add_argument('--script-path', help='Path for S3 delete script')
+    parser.add_argument('--sync-index-with-aws', action='store_true', 
+                        help='Synchronize index with AWS S3 and Windows shares (no uploads)')
+    parser.add_argument('--s3-only', action='store_true', 
+                        help='Show only files that exist in S3 but not in Windows shares')
     
     args = parser.parse_args()
     
@@ -1772,11 +2014,20 @@ def main():
     if args.test_connection:
         test_share_connections(config)
         return
+    
+    # Handle the new sync-index-with-aws argument
+    if args.sync_index_with_aws:
+        backup_manager = BackupManager(config)
+        try:
+            backup_manager.sync_index_with_aws()
+        finally:
+            backup_manager.close()
+        return
         
     # List index if requested
     if args.list_index:
         list_index(config, show_deleted=args.show_deleted, share_filter=args.share, 
-                  export_path=args.export_csv, include_moved=args.show_moved)
+                  export_path=args.export_csv, include_moved=args.show_moved, s3_only=args.s3_only)
         return
         
     # Generate deleted files report if requested
