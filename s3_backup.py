@@ -16,6 +16,8 @@ import time
 import configparser
 import base64
 import getpass
+import smtplib
+from email.message import EmailMessage
 from io import StringIO
 from pathlib import Path
 import boto3
@@ -136,6 +138,14 @@ class Config:
         self.scan_interval = 24  # hours
         self.thread_count = 4
         
+        # Email notification defaults
+        self.email_enabled = False
+        self.email_smtp_server = 'localhost'
+        self.email_smtp_port = 25
+        self.email_from = ''
+        self.email_to = ''
+        self.email_subject_prefix = '[S3 Backup]'
+        
         self.load_config()
     
     def load_config(self):
@@ -194,6 +204,15 @@ class Config:
                 self.scan_interval = int(self.config['General'].get('scan_interval', '24'))
                 self.thread_count = int(self.config['General'].get('thread_count', '4'))
             
+            # Email notification settings
+            if 'Email' in self.config:
+                self.email_enabled = self.config['Email'].getboolean('enabled', False)
+                self.email_smtp_server = self.config['Email'].get('smtp_server', 'localhost')
+                self.email_smtp_port = int(self.config['Email'].get('smtp_port', '25'))
+                self.email_from = self.config['Email'].get('from', '')
+                self.email_to = self.config['Email'].get('to', '')
+                self.email_subject_prefix = self.config['Email'].get('subject_prefix', '[S3 Backup]')
+            
             # Shares
             if 'Shares' in self.config:
                 for key, value in self.config['Shares'].items():
@@ -230,6 +249,15 @@ class Config:
             'report_path': 'reports/',
             'scan_interval': '24',
             'thread_count': '4'
+        }
+        
+        self.config['Email'] = {
+            'enabled': 'false',
+            'smtp_server': 'localhost',
+            'smtp_port': '25',
+            'from': 'backup@example.com',
+            'to': 'admin@example.com',
+            'subject_prefix': '[S3 Backup]'
         }
         
         self.config['Shares'] = {
@@ -1301,6 +1329,13 @@ Next Steps:
         logger.info(report)
         print(report)
         
+        # Send email notification if enabled
+        if self.config.email_enabled:
+            self.send_email(
+                subject="AWS S3 Sync Report",
+                body=report
+            )
+        
         # Create a CSV report of the synchronization
         report_file = os.path.join(
             self.config.report_path, 
@@ -1493,6 +1528,41 @@ Status: {status}
         
         logger.info(details)
         print(details)
+        
+        # Send email notification if enabled
+        if self.config.email_enabled:
+            self.send_email(
+                subject=f"Backup Summary - {status}",
+                body=details
+            )
+    
+    def send_email(self, subject, body):
+        """Send an email notification with the backup summary."""
+        if not self.config.email_enabled:
+            return
+        
+        # Verify email configuration
+        if not self.config.email_from or not self.config.email_to:
+            logger.warning("Email notification enabled but missing from/to address. Skipping notification.")
+            return
+            
+        try:
+            # Create the email message
+            msg = EmailMessage()
+            msg['Subject'] = f"{self.config.email_subject_prefix} {subject}"
+            msg['From'] = self.config.email_from
+            msg['To'] = self.config.email_to
+            msg.set_content(body)
+            
+            # Send the email
+            logger.info(f"Sending email notification to {self.config.email_to}")
+            with smtplib.SMTP(self.config.email_smtp_server, self.config.email_smtp_port) as server:
+                server.send_message(msg)
+            logger.info("Email notification sent successfully")
+        except Exception as e:
+            # Don't fail the backup job if email fails
+            logger.error(f"Failed to send email notification: {str(e)}")
+            # Log the error but don't raise exception to continue the backup process
     
     def generate_report(self, success_records, failure_records):
         """Generate CSV report of backup results."""

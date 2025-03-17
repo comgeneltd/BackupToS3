@@ -59,6 +59,22 @@ thread_count = 4
 - `scan_interval` is in hours
 - `thread_count` is the number of parallel uploads
 
+### Email Notification Settings
+
+```ini
+[Email]
+enabled = false
+smtp_server = localhost
+smtp_port = 25
+from = backup@example.com
+to = admin@example.com
+subject_prefix = [S3 Backup]
+```
+
+- Set `enabled` to `true` to receive email notifications for backup operations
+- Email uses a local mail relay with no authentication
+- Email failures will not interrupt the backup process
+
 ### Share Settings
 
 ```ini
