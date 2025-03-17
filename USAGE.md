@@ -56,8 +56,10 @@ scan_interval = 24
 thread_count = 4
 ```
 
-- `scan_interval` is in hours
-- `thread_count` is the number of parallel uploads
+- `db_path` - Path to the SQLite database file that stores the backup index
+- `report_path` - Directory where backup reports will be saved
+- `scan_interval` - Hours between automatic backups (only used with `--schedule` flag, ignored when using cron/systemd)
+- `thread_count` - Number of parallel upload threads (higher values may improve performance)
 
 ### Email Notification Settings
 
@@ -104,9 +106,11 @@ Format: `server_ip,share_name,username,password,domain/workgroup`
 # Run backup immediately
 ./s3backup.sh --run-now
 
-# Start scheduled backups
+# Start built-in scheduler (uses scan_interval from config.ini)
 ./s3backup.sh --schedule
 ```
+
+The `--schedule` flag activates the tool's built-in scheduler, which runs backups at intervals defined by the `scan_interval` setting (default: 24 hours). This is separate from and an alternative to using cron or systemd scheduling.
 
 ### AWS Sync Operations
 
@@ -171,7 +175,18 @@ export BACKUP_PASSWORD=your_password
 
 ## Setting Up Scheduled Jobs
 
-### Using Cron
+You can set up automated backups using either the built-in scheduler or external scheduling systems.
+
+### Using Built-in Scheduler
+
+```bash
+# Start the built-in scheduler (runs based on scan_interval in config.ini)
+./s3backup.sh --schedule
+```
+
+The built-in scheduler is suitable for simple setups but lacks the reliability features of system schedulers. It will continue to run until the process is terminated.
+
+### Using Cron (Recommended)
 
 ```bash
 # Edit crontab
