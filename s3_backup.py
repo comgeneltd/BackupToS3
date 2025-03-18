@@ -1518,6 +1518,10 @@ Next Steps:
     
     def upload_file_to_s3(self, file_info, s3_key):
         """Upload a file to S3 and update the index."""
+        # Initialize variables
+        temp_path = None
+        scanner = None
+        
         try:
             # Create a temporary file
             share_path = file_info['share_path']
@@ -1533,32 +1537,36 @@ Next Steps:
                 # Download to temp file
                 temp_path = scanner.get_temp_file(share_path, os.path.basename(share_path))
                 
-                # Upload to S3
-                success = self.s3_manager.upload_file(temp_path, s3_key)
-                
-                # Clean up temp file
-                os.unlink(temp_path)
-                
-                if success:
-                    # Update the database
-                    self.db_manager.add_file(
-                        local_path=file_info['local_path'],
-                        s3_path=s3_key,
-                        size=file_info['size'],
-                        last_modified=file_info['last_modified'].isoformat(),
-                        checksum=file_info['checksum'],
-                        previous_path=None,
-                        moved_in_s3=0,
-                        file_name=file_info['file_name']
-                    )
-                    return True
-                return False
+                try:
+                    # Upload to S3
+                    success = self.s3_manager.upload_file(temp_path, s3_key)
+                    
+                    if success:
+                        # Update the database
+                        self.db_manager.add_file(
+                            local_path=file_info['local_path'],
+                            s3_path=s3_key,
+                            size=file_info['size'],
+                            last_modified=file_info['last_modified'].isoformat(),
+                            checksum=file_info['checksum'],
+                            previous_path=None,
+                            moved_in_s3=0,
+                            file_name=file_info.get('file_name', os.path.basename(share_path))
+                        )
+                        return True
+                    return False
+                finally:
+                    # Clean up temp file
+                    if os.path.exists(temp_path):
+                        try:
+                            os.unlink(temp_path)
+                        except Exception as e:
+                            logger.warning(f"Failed to remove temp file {temp_path}: {e}")
             finally:
                 scanner.disconnect()
         except Exception as e:
             logger.error(f"Error uploading {file_info['local_path']}: {str(e)}")
             return False
-    
     def verify_and_upload_missing(self):
         """
         Verify files in the index exist in S3 and upload any missing files.
@@ -1591,7 +1599,7 @@ Next Steps:
             
             # Check each file in the index
             for file_record in all_files:
-                file_id, local_path, s3_path, size, last_modified, checksum, is_deleted, last_backup = file_record
+                file_id, local_path, s3_path, size, last_modified, checksum, is_deleted, last_backup, *_ = file_record
                 files_processed += 1
                 
                 # Skip deleted files
