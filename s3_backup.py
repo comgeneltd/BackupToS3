@@ -663,6 +663,23 @@ class ShareScanner:
             md5.update(chunk)
         return md5.hexdigest()
     
+    def calculate_streaming_checksum(self, file_path):
+        """Calculate MD5 checksum by streaming the file without saving to disk."""
+        import tempfile
+        md5 = hashlib.md5()
+        file_obj = tempfile.SpooledTemporaryFile(max_size=10*1024*1024)  # 10MB in-memory buffer
+        
+        try:
+            self.conn.retrieveFile(self.share_config['name'], file_path, file_obj)
+            file_obj.seek(0)
+            
+            for chunk in iter(lambda: file_obj.read(8192), b''):
+                md5.update(chunk)
+                
+            return md5.hexdigest()
+        finally:
+            file_obj.close()
+    
     def get_temp_file(self, path, filename):
         """Download a file to a temporary location and return the path."""
         temp_path = os.path.join('/tmp', filename)
@@ -724,15 +741,8 @@ class ShareScanner:
                     
                     # For changed or new files, calculate checksum
                     try:
-                        # Download to temp file
-                        temp_path = self.get_temp_file(full_path, file_name)
-                        
-                        # Calculate checksum
-                        with open(temp_path, 'rb') as file_obj:
-                            checksum = self.calculate_checksum(file_obj)
-                        
-                        # Remove temp file
-                        os.unlink(temp_path)
+                        # Calculate checksum by streaming the file (no temp file needed)
+                        checksum = self.calculate_streaming_checksum(full_path)
                         
                         # Yield the file information
                         yield {
