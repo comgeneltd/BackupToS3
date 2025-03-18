@@ -106,11 +106,16 @@ Format: `server_ip,share_name,username,password,domain/workgroup`
 # Run backup immediately
 ./s3backup.sh --run-now
 
+# Verify files in index exist in S3 without running a backup
+./s3backup.sh --run-now-verify
+
 # Start built-in scheduler (uses scan_interval from config.ini)
 ./s3backup.sh --schedule
 ```
 
 The `--schedule` flag activates the tool's built-in scheduler, which runs backups at intervals defined by the `scan_interval` setting (default: 24 hours). This is separate from and an alternative to using cron or systemd scheduling.
+
+The `--run-now-verify` option checks that each file in the index actually exists in S3 and has the correct checksum, without uploading any new files. This is useful to verify backup integrity or identify any synchronization issues.
 
 ### AWS Sync Operations
 
@@ -194,6 +199,9 @@ crontab -e
 
 # Add a line to run daily at 2 AM
 0 2 * * * /path/to/s3backup.sh --run-now --password-file /path/to/.backup_password
+
+# Add verification job to run weekly (Sundays at 3 AM)
+0 3 * * 0 /path/to/s3backup.sh --run-now-verify --password-file /path/to/.backup_password
 ```
 
 ### Using Systemd
@@ -250,6 +258,44 @@ sudo systemctl enable s3backup.timer
 sudo systemctl start s3backup.timer
 ```
 
+6. Optionally, create a verification service and timer:
+
+```bash
+sudo vi /etc/systemd/system/s3backup-verify.service
+```
+
+```ini
+[Unit]
+Description=S3 Windows Share Backup Verification
+After=network.target
+
+[Service]
+Type=simple
+User=username
+WorkingDirectory=/path/to/s3backup
+ExecStart=/path/to/s3backup.sh --run-now-verify --password-file /path/to/.backup_password
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo vi /etc/systemd/system/s3backup-verify.timer
+```
+
+```ini
+[Unit]
+Description=Run S3 Backup Verification Weekly
+
+[Timer]
+OnCalendar=Sun *-*-* 03:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
 ## Migrating from Another Backup Solution
 
 If you're replacing an existing backup solution and already have files in S3:
@@ -287,6 +333,12 @@ vi config.ini
 ./s3backup.sh --list-index --s3-only
 ```
 
+7. Verify all indexed files exist in S3 with correct checksums
+
+```bash
+./s3backup.sh --run-now-verify
+```
+
 This migration workflow prevents re-uploading already backed up files, saving time and bandwidth.
 
 ## Troubleshooting
@@ -320,6 +372,14 @@ Check the log file for detailed information:
 tail -100 s3_backup.log
 ```
 
+### Backup Verification Failures
+
+If `--run-now-verify` reports missing or different files:
+
+1. Check if the files have been accidentally deleted from S3
+2. Verify the S3 bucket, prefix, and storage class settings
+3. Run a regular backup with `--run-now` to re-upload any missing files
+
 ## Understanding Backup Reports
 
 After each backup run, a report is generated in the `reports/` directory containing:
@@ -335,3 +395,8 @@ When using the AWS sync functionality, a special sync report is also generated s
 - Files matched between S3 and shares
 - Files that exist only in S3
 - Files that need to be uploaded
+
+Verification reports include:
+- Files successfully verified in S3
+- Files missing from S3
+- Files with checksum mismatches

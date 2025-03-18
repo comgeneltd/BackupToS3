@@ -9,6 +9,7 @@ A tool for backing up Windows shares to S3 storage with local indexing.
 - Deduplication of files using checksum comparison
 - Support for encrypted configuration to protect credentials
 - Scheduling capabilities for automated backups
+- Verification of backups to ensure data integrity
 - Detailed reports and logging
 
 ## Documentation
@@ -24,4 +25,4 @@ See the [Usage Guide](docs/USAGE.md) for detailed instructions.
 
 ## License
 
-[Add your chosen license here]
+GNU General Public License v3.0
