@@ -195,7 +195,10 @@ class Config:
                 self.aws_region = self.config['AWS'].get('region', 'us-east-1')
                 self.s3_bucket = self.config['AWS'].get('bucket', '')
                 self.s3_prefix = self.config['AWS'].get('prefix', '')
-                self.storage_class = self.config['AWS'].get('storage_class', 'STANDARD_IA')
+                
+                # Properly get storage_class and normalize it
+                self.storage_class = self.config['AWS'].get('storage_class', 'STANDARD_IA').upper().replace(' ', '_')
+                logger.debug(f"Loaded storage class from config: {self.storage_class}")
             
             # General Settings
             if 'General' in self.config:
@@ -733,27 +736,12 @@ class S3Manager:
     def upload_file(self, local_file_path, s3_key):
         """Upload a file to S3 storage."""
         try:
-            # Extensive logging to understand configuration
-            logger.info(f"Config object attributes: {dir(self.config)}")
-            logger.info(f"Config dict representation: {vars(self.config)}")
+            # Use the storage_class attribute directly from config
+            storage_class = self.config.storage_class
+            logger.debug(f"Using storage class for upload: {storage_class}")
             
-            # Check config sections
-            logger.info("Config sections:")
-            for section in self.config.config.sections():
-                logger.info(f"Section {section}:")
-                for key, value in self.config.config[section].items():
-                    logger.info(f"  {key}: {value}")
-            
-            # Specific logging for storage class
-            logger.info(f"Raw storage class value: {getattr(self.config, 'storage_class', 'NOT FOUND')}")
-            
-            # Attempt to get storage class from config sections
-            config_storage_class = self.config.config['AWS'].get('storage_class', 'STANDARD_IA') if 'AWS' in self.config.config else 'STANDARD_IA'
-            logger.info(f"Storage class from config sections: {config_storage_class}")
-            
-            # Use the storage class from config sections
             extra_args = {
-                'StorageClass': config_storage_class.upper().replace(' ', '_')
+                'StorageClass': storage_class
             }
             
             self.s3_client.upload_file(
@@ -767,10 +755,14 @@ class S3Manager:
             return True
         except botocore.exceptions.ClientError as e:
             logger.error(f"Error uploading {local_file_path} to S3: {str(e)}")
-            logger.error(f"Detailed error: {e.response}")
+            # Add error details for better debugging
+            if hasattr(e, 'response') and 'Error' in e.response:
+                logger.error(f"Error details: {e.response['Error']}")
             return False
         except Exception as e:
             logger.error(f"Unexpected error uploading {local_file_path}: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
             return False
     
     def copy_object(self, source_key, dest_key):
@@ -779,18 +771,24 @@ class S3Manager:
             # Source must include the bucket name
             copy_source = {'Bucket': self.config.s3_bucket, 'Key': source_key}
             
+            # Use the storage_class attribute directly
+            storage_class = self.config.storage_class
+            logger.debug(f"Using storage class for copy: {storage_class}")
+            
             # Copy the object with the same storage class
             self.s3_client.copy_object(
                 CopySource=copy_source,
                 Bucket=self.config.s3_bucket,
                 Key=dest_key,
-                StorageClass=self.config.storage_class
+                StorageClass=storage_class
             )
             
             logger.info(f"Successfully copied s3://{self.config.s3_bucket}/{source_key} to s3://{self.config.s3_bucket}/{dest_key}")
             return True
         except botocore.exceptions.ClientError as e:
             logger.error(f"Error copying S3 object {source_key} to {dest_key}: {str(e)}")
+            if hasattr(e, 'response') and 'Error' in e.response:
+                logger.error(f"Error details: {e.response['Error']}")
             return False
     
     def delete_object(self, s3_key):
@@ -1029,7 +1027,7 @@ class BackupManager:
                             continue
                     
                     # If file changed or is new (and not moved/renamed), mark it for upload
-                    if not existing_file or existing_file[4] != file_info['checksum']:
+                    if not existing_file or existing_file[5] != file_info['checksum']:  # Fixed index from 4 to 5
                         files_changed += 1
                         yield file_info, s3_key
             finally:
