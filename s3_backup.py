@@ -338,7 +338,7 @@ class DatabaseManager:
                 self.conn = sqlite3.connect(self.db_path)
                 cursor = self.conn.cursor()
                 
-                # Create files table
+                # Create files table with file_name column
                 cursor.execute('''
                 CREATE TABLE IF NOT EXISTS files (
                     id INTEGER PRIMARY KEY,
@@ -351,6 +351,7 @@ class DatabaseManager:
                     last_backup TIMESTAMP,
                     previous_path TEXT,
                     moved_in_s3 INTEGER DEFAULT 0,
+                    file_name TEXT,
                     UNIQUE(local_path)
                 )
                 ''')
@@ -373,8 +374,9 @@ class DatabaseManager:
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_local_path ON files (local_path)')
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_is_deleted ON files (is_deleted)')
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_checksum ON files (checksum)')  # Add index for checksum lookups
+                cursor.execute('CREATE INDEX IF NOT EXISTS idx_file_name ON files (file_name)')  # Add index for file_name lookups
                 
-                # Check if moved_in_s3 column exists (for backward compatibility)
+                # Check for columns needing migration
                 cursor.execute("PRAGMA table_info(files)")
                 columns = [column[1] for column in cursor.fetchall()]
                 
@@ -388,6 +390,29 @@ class DatabaseManager:
                         self.conn.commit()
                     except sqlite3.Error as e:
                         logger.error(f"Error adding moved_in_s3 column: {str(e)}")
+                
+                # If file_name column is missing, add it and populate from local_path
+                if 'file_name' not in columns:
+                    try:
+                        logger.info("Adding file_name column to files table")
+                        cursor.execute("ALTER TABLE files ADD COLUMN file_name TEXT")
+                        
+                        # Initialize file_name with basename from local_path
+                        cursor.execute("""
+                        UPDATE files SET file_name = 
+                        CASE
+                            WHEN instr(local_path, ':') > 0 
+                            THEN substr(local_path, 
+                                 instr(local_path, ':') + 1 + length(local_path) - 
+                                 instr(reverse(local_path), '/') - instr(local_path, ':'))
+                            ELSE substr(local_path, length(local_path) - instr(reverse(local_path), '/') + 1)
+                        END
+                        """)
+                        
+                        logger.info(f"Updated {cursor.rowcount} existing files with file_name")
+                        self.conn.commit()
+                    except sqlite3.Error as e:
+                        logger.error(f"Error adding file_name column: {str(e)}")
                 
                 self.conn.commit()
                 logger.info("Database initialized successfully")
@@ -406,7 +431,7 @@ class DatabaseManager:
                 self.conn.close()
                 self.conn = None
     
-    def add_file(self, local_path, s3_path, size, last_modified, checksum, previous_path=None, moved_in_s3=0):
+    def add_file(self, local_path, s3_path, size, last_modified, checksum, previous_path=None, moved_in_s3=0, file_name=None):
         """Add or update a file in the index."""
         try:
             with self.lock:
@@ -414,9 +439,14 @@ class DatabaseManager:
                 cursor = conn.cursor()
                 now = datetime.datetime.now()
                 
+                # If file_name not provided, extract it from local_path
+                if file_name is None:
+                    file_path_part = local_path.split(':', 1)[1] if ':' in local_path else local_path
+                    file_name = os.path.basename(file_path_part)
+                
                 cursor.execute('''
-                INSERT INTO files (local_path, s3_path, size, last_modified, checksum, last_backup, previous_path, moved_in_s3)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO files (local_path, s3_path, size, last_modified, checksum, last_backup, previous_path, moved_in_s3, file_name)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(local_path) DO UPDATE SET
                     s3_path=excluded.s3_path,
                     size=excluded.size,
@@ -425,8 +455,9 @@ class DatabaseManager:
                     is_deleted=0,
                     last_backup=excluded.last_backup,
                     previous_path=excluded.previous_path,
-                    moved_in_s3=excluded.moved_in_s3
-                ''', (local_path, s3_path, size, last_modified, checksum, now, previous_path, moved_in_s3))
+                    moved_in_s3=excluded.moved_in_s3,
+                    file_name=excluded.file_name
+                ''', (local_path, s3_path, size, last_modified, checksum, now, previous_path, moved_in_s3, file_name))
                 
                 conn.commit()
                 return True
@@ -456,7 +487,7 @@ class DatabaseManager:
                 conn = self.get_connection()
                 cursor = conn.cursor()
                 cursor.execute('''
-                SELECT id, local_path, s3_path, size, last_modified, checksum, is_deleted, last_backup
+                SELECT id, local_path, s3_path, size, last_modified, checksum, is_deleted, last_backup, file_name
                 FROM files WHERE local_path=?
                 ''', (local_path,))
                 return cursor.fetchone()
@@ -471,7 +502,7 @@ class DatabaseManager:
                 conn = self.get_connection()
                 cursor = conn.cursor()
                 cursor.execute('''
-                SELECT id, local_path, s3_path, size, last_modified, checksum, is_deleted, last_backup
+                SELECT id, local_path, s3_path, size, last_modified, checksum, is_deleted, last_backup, file_name
                 FROM files WHERE checksum=? AND is_deleted=0 LIMIT 1
                 ''', (checksum,))
                 return cursor.fetchone()
@@ -487,12 +518,12 @@ class DatabaseManager:
                 cursor = conn.cursor()
                 if include_deleted:
                     cursor.execute('''
-                    SELECT id, local_path, s3_path, size, last_modified, checksum, is_deleted, last_backup
+                    SELECT id, local_path, s3_path, size, last_modified, checksum, is_deleted, last_backup, file_name
                     FROM files
                     ''')
                 else:
                     cursor.execute('''
-                    SELECT id, local_path, s3_path, size, last_modified, checksum, is_deleted, last_backup
+                    SELECT id, local_path, s3_path, size, last_modified, checksum, is_deleted, last_backup, file_name
                     FROM files WHERE is_deleted=0
                     ''')
                 return cursor.fetchall()
@@ -507,7 +538,7 @@ class DatabaseManager:
                 conn = self.get_connection()
                 cursor = conn.cursor()
                 cursor.execute('''
-                SELECT id, local_path, s3_path, size, last_modified, checksum, is_deleted, last_backup
+                SELECT id, local_path, s3_path, size, last_modified, checksum, is_deleted, last_backup, file_name
                 FROM files WHERE is_deleted=1
                 ''')
                 return cursor.fetchall()
@@ -751,7 +782,8 @@ class ShareScanner:
                             'size': file_info.file_size,
                             'last_modified': last_modified,
                             'checksum': checksum,
-                            'share_config': self.share_config
+                            'share_config': self.share_config,
+                            'file_name': file_name  # Add filename for proper comparison
                         }
                     except Exception as e:
                         logger.error(f"Error processing file {full_path}: {str(e)}")
@@ -1041,62 +1073,109 @@ class BackupManager:
                         checksum_match = self.db_manager.get_file_by_checksum(file_info['checksum'])
                         
                         if checksum_match:
-                            # Get existing record to check if it's already been moved in S3
-                            with self.db_manager.lock:
-                                conn = self.db_manager.get_connection()
-                                cursor = conn.cursor()
-                                cursor.execute('''
-                                SELECT moved_in_s3 FROM files WHERE local_path=?
-                                ''', (file_info['local_path'],))
-                                result = cursor.fetchone()
-                                already_moved = result and result[0] == 1
-                            
-                            # This is likely a moved file - update S3 to match if not already moved
+                            # Get original file name and new file name
                             old_path = checksum_match[1]
-                            old_s3_path = checksum_match[2]
-                            new_s3_path = s3_key
+                            old_name = checksum_match[8] if len(checksum_match) > 8 and checksum_match[8] else os.path.basename(old_path.split(':', 1)[1] if ':' in old_path else old_path)
+                            new_name = file_info['file_name']
                             
-                            logger.info(f"Detected moved file: {old_path} -> {file_info['local_path']}")
-                            logger.info(f"S3 path: {old_s3_path} -> {new_s3_path}")
+                            # Check if file with same path still exists in original location
+                            old_file_exists = False
                             
-                            # Only move in S3 if not already moved and paths differ
-                            moved_in_s3_flag = 0
-                            if not already_moved and old_s3_path != new_s3_path:
-                                logger.info(f"Moving file in S3 (not previously moved)")
-                                # Copy to new location, then delete from old location
-                                if self.s3_manager.copy_object(old_s3_path, new_s3_path):
-                                    if self.s3_manager.delete_object(old_s3_path):
-                                        moved_in_s3_flag = 1
-                                        logger.info(f"Successfully moved file in S3")
+                            # Extract share name and path from old_path
+                            old_path_parts = old_path.split(':', 1)
+                            if len(old_path_parts) == 2:
+                                old_share_name, old_file_path = old_path_parts
+                                
+                                # Find matching share config
+                                old_share_config = None
+                                for share in self.config.shares:
+                                    if share['local_name'] == old_share_name:
+                                        old_share_config = share
+                                        break
+                                
+                                if old_share_config:
+                                    # Check if file exists in original location
+                                    old_scanner = ShareScanner(old_share_config, self.db_manager)
+                                    try:
+                                        if old_scanner.connect():
+                                            try:
+                                                old_scanner.conn.getAttributes(old_share_config['name'], old_file_path)
+                                                old_file_exists = True
+                                                logger.info(f"Original file still exists at: {old_path}")
+                                            except:
+                                                old_file_exists = False
+                                                logger.info(f"Original file no longer exists at: {old_path}")
+                                    finally:
+                                        old_scanner.disconnect()
+                            
+                            # Only consider it a move/rename if:
+                            # 1. The file no longer exists in the old location, AND
+                            # 2. The filename matches the old filename
+                            if not old_file_exists and old_name == new_name:
+                                logger.info(f"Detected true moved file: {old_path} -> {file_info['local_path']}")
+                                logger.info(f"S3 path: {checksum_match[2]} -> {s3_key}")
+                                
+                                # Get existing record to check if it's already been moved in S3
+                                with self.db_manager.lock:
+                                    conn = self.db_manager.get_connection()
+                                    cursor = conn.cursor()
+                                    cursor.execute('''
+                                    SELECT moved_in_s3 FROM files WHERE local_path=?
+                                    ''', (file_info['local_path'],))
+                                    result = cursor.fetchone()
+                                    already_moved = result and result[0] == 1
+                                
+                                # This is a true moved file - update S3 to match if not already moved
+                                old_s3_path = checksum_match[2]
+                                new_s3_path = s3_key
+                                
+                                # Only move in S3 if not already moved and paths differ
+                                moved_in_s3_flag = 0
+                                if not already_moved and old_s3_path != new_s3_path:
+                                    logger.info(f"Moving file in S3 (not previously moved)")
+                                    # Copy to new location, then delete from old location
+                                    if self.s3_manager.copy_object(old_s3_path, new_s3_path):
+                                        if self.s3_manager.delete_object(old_s3_path):
+                                            moved_in_s3_flag = 1
+                                            logger.info(f"Successfully moved file in S3")
+                                        else:
+                                            logger.warning(f"File copied to new location but delete from old location failed")
+                                            # Still consider it a success since the copy worked
+                                            moved_in_s3_flag = 1
                                     else:
-                                        logger.warning(f"File copied to new location but delete from old location failed")
-                                        # Still consider it a success since the copy worked
-                                        moved_in_s3_flag = 1
-                                else:
-                                    logger.error(f"Failed to move file in S3, keeping the old S3 path in database")
-                                    # Use the old S3 path since the copy failed
-                                    new_s3_path = old_s3_path
-                            elif already_moved:
-                                logger.info(f"File was already moved in S3, skipping S3 move operation")
-                                moved_in_s3_flag = 1
-                            elif old_s3_path == new_s3_path:
-                                # Same S3 path, no need to move in S3 but mark as moved
-                                logger.info(f"S3 paths are the same, no need to move file in S3")
-                                moved_in_s3_flag = 1
-                            
-                            # Update the database with the new path and moved status
-                            self.db_manager.add_file(
-                                local_path=file_info['local_path'],
-                                s3_path=new_s3_path,
-                                size=file_info['size'],
-                                last_modified=file_info['last_modified'].isoformat(),
-                                checksum=file_info['checksum'],
-                                previous_path=old_path,
-                                moved_in_s3=moved_in_s3_flag
-                            )
-                            
-                            self.files_moved += 1
-                            continue
+                                        logger.error(f"Failed to move file in S3, keeping the old S3 path in database")
+                                        # Use the old S3 path since the copy failed
+                                        new_s3_path = old_s3_path
+                                elif already_moved:
+                                    logger.info(f"File was already moved in S3, skipping S3 move operation")
+                                    moved_in_s3_flag = 1
+                                elif old_s3_path == new_s3_path:
+                                    # Same S3 path, no need to move in S3 but mark as moved
+                                    logger.info(f"S3 paths are the same, no need to move file in S3")
+                                    moved_in_s3_flag = 1
+                                
+                                # Update the database with the new path and moved status
+                                self.db_manager.add_file(
+                                    local_path=file_info['local_path'],
+                                    s3_path=new_s3_path,
+                                    size=file_info['size'],
+                                    last_modified=file_info['last_modified'].isoformat(),
+                                    checksum=file_info['checksum'],
+                                    previous_path=old_path,
+                                    moved_in_s3=moved_in_s3_flag,
+                                    file_name=file_info['file_name']
+                                )
+                                
+                                self.files_moved += 1
+                                continue
+                            else:
+                                # This is a new file that happens to have the same content as another file
+                                # Treat as a new file and upload it
+                                logger.info(f"Found duplicate file with same content but not moved: {file_info['local_path']}")
+                                logger.info(f"Original file: {old_path}, New file: {file_info['local_path']}")
+                                files_changed += 1
+                                yield file_info, s3_key
+                                continue
                     
                     # If file changed or is new (and not moved/renamed), mark it for upload
                     if not existing_file or existing_file[5] != file_info['checksum']:
@@ -1296,7 +1375,8 @@ class BackupManager:
                             last_modified=file_info['last_modified'].isoformat(),
                             checksum=file_info['checksum'],
                             previous_path=None,
-                            moved_in_s3=0
+                            moved_in_s3=0,
+                            file_name=file_info['file_name']
                         )
                         files_matched += 1
                         share_stats[share_name]['matched'] += 1
@@ -1313,7 +1393,8 @@ class BackupManager:
                             last_modified=file_info['last_modified'].isoformat(),
                             checksum=file_info['checksum'],
                             previous_path=None,
-                            moved_in_s3=0
+                            moved_in_s3=0,
+                            file_name=file_info['file_name']
                         )
                         share_stats[share_name]['new'] += 1
                     
@@ -1467,7 +1548,8 @@ Next Steps:
                         last_modified=file_info['last_modified'].isoformat(),
                         checksum=file_info['checksum'],
                         previous_path=None,
-                        moved_in_s3=0
+                        moved_in_s3=0,
+                        file_name=file_info['file_name']
                     )
                     return True
                 return False
@@ -1557,13 +1639,15 @@ Next Steps:
                                     checksum = actual_checksum
                                 
                                 # Create file_info for uploading
+                                file_name = os.path.basename(file_path)
                                 file_info = {
                                     'local_path': local_path,
                                     'share_path': file_path,
                                     'size': size,
                                     'last_modified': datetime.datetime.fromisoformat(last_modified),
                                     'checksum': checksum,
-                                    'share_config': share_config
+                                    'share_config': share_config,
+                                    'file_name': file_name
                                 }
                                 
                                 # Submit for upload
@@ -1611,7 +1695,8 @@ Next Steps:
                             last_modified=file_info['last_modified'].isoformat(),
                             checksum=file_info['checksum'],
                             previous_path=None,
-                            moved_in_s3=0
+                            moved_in_s3=0,
+                            file_name=file_info['file_name']
                         )
                         
                         # Add to success records
