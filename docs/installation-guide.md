@@ -72,7 +72,63 @@ sudo yum install -y python3 python3-pip python3-devel samba-client-libs samba-cl
    ```bash
    vi config.ini
    ```
+## Configuration
 
+### AWS Settings
+
+In your `config.ini` file, configure the AWS section:
+
+```ini
+[AWS]
+access_key = YOUR_AWS_ACCESS_KEY
+secret_key = YOUR_AWS_SECRET_KEY
+region = us-east-1
+bucket = your-bucket-name
+prefix = 
+storage_class = STANDARD_IA
+```
+
+Available storage classes:
+- `STANDARD` - Frequently accessed data
+- `STANDARD_IA` - Infrequent access, long-lived data
+- `ONEZONE_IA` - Infrequent access, non-critical data
+- `INTELLIGENT_TIERING` - Unknown or changing access patterns
+- `GLACIER` - Long-term archival (minutes to hours retrieval)
+- `DEEP_ARCHIVE` - Long-term archival (hours retrieval)
+- `GLACIER_IR` - Archive data with immediate access
+
+### General Settings
+
+```ini
+[General]
+db_path = backup_index.db
+report_path = reports/
+scan_interval = 24
+thread_count = 4
+```
+
+### Email Notification Settings
+
+```ini
+[Email]
+enabled = false
+smtp_server = localhost
+smtp_port = 25
+from = backup@example.com
+to = admin@example.com
+subject_prefix = [S3 Backup]
+```
+
+### Share Settings
+
+```ini
+[Shares]
+finance = 192.168.1.10,FinanceShare,username,password,WORKGROUP
+marketing = 192.168.1.10,MarketingShare,username,password,WORKGROUP
+guest_share = 192.168.1.10,PublicShare,guest,,
+```
+
+Format: `server_ip,share_name,username,password,domain/workgroup`
 ## AWS Requirements
 
 1. **S3 Bucket**: You must have an existing S3 bucket
