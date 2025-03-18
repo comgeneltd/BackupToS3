@@ -322,114 +322,100 @@ class DatabaseManager:
     def __init__(self, db_path):
         self.db_path = db_path
         self.conn = None
-        self.lock = threading.RLock()  # Reentrant lock for thread safety
         self.initialize_db()
-    
-    def get_connection(self):
-        """Get a thread-local database connection."""
-        if not hasattr(threading.current_thread(), '_db_conn'):
-            threading.current_thread()._db_conn = sqlite3.connect(self.db_path)
-        return threading.current_thread()._db_conn
     
     def initialize_db(self):
         """Initialize the database and create tables if they don't exist."""
         try:
-            with self.lock:
-                self.conn = sqlite3.connect(self.db_path)
-                cursor = self.conn.cursor()
-                
-                # Create files table
-                cursor.execute('''
-                CREATE TABLE IF NOT EXISTS files (
-                    id INTEGER PRIMARY KEY,
-                    local_path TEXT NOT NULL,
-                    s3_path TEXT NOT NULL,
-                    size INTEGER NOT NULL,
-                    last_modified TIMESTAMP NOT NULL,
-                    checksum TEXT NOT NULL,
-                    is_deleted INTEGER DEFAULT 0,
-                    last_backup TIMESTAMP,
-                    previous_path TEXT,
-                    moved_in_s3 INTEGER DEFAULT 0,
-                    UNIQUE(local_path)
-                )
-                ''')
-                
-                # Create backup_runs table to track each backup operation
-                cursor.execute('''
-                CREATE TABLE IF NOT EXISTS backup_runs (
-                    id INTEGER PRIMARY KEY,
-                    start_time TIMESTAMP NOT NULL,
-                    end_time TIMESTAMP,
-                    status TEXT,
-                    files_processed INTEGER DEFAULT 0,
-                    files_uploaded INTEGER DEFAULT 0,
-                    bytes_uploaded INTEGER DEFAULT 0,
-                    files_failed INTEGER DEFAULT 0
-                )
-                ''')
-                
-                # Index for faster lookups
-                cursor.execute('CREATE INDEX IF NOT EXISTS idx_local_path ON files (local_path)')
-                cursor.execute('CREATE INDEX IF NOT EXISTS idx_is_deleted ON files (is_deleted)')
-                cursor.execute('CREATE INDEX IF NOT EXISTS idx_checksum ON files (checksum)')  # Add index for checksum lookups
-                
-                # Check if moved_in_s3 column exists (for backward compatibility)
-                cursor.execute("PRAGMA table_info(files)")
-                columns = [column[1] for column in cursor.fetchall()]
-                
-                # If moved_in_s3 column is missing, add it and mark all files with a previous_path
-                if 'moved_in_s3' not in columns:
-                    try:
-                        logger.info("Adding moved_in_s3 column to files table")
-                        cursor.execute("ALTER TABLE files ADD COLUMN moved_in_s3 INTEGER DEFAULT 0")
-                        cursor.execute("UPDATE files SET moved_in_s3 = 1 WHERE previous_path IS NOT NULL")
-                        logger.info(f"Marked {cursor.rowcount} existing moved files")
-                        self.conn.commit()
-                    except sqlite3.Error as e:
-                        logger.error(f"Error adding moved_in_s3 column: {str(e)}")
-                
-                self.conn.commit()
-                logger.info("Database initialized successfully")
+            self.conn = sqlite3.connect(self.db_path)
+            cursor = self.conn.cursor()
+            
+            # Create files table
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS files (
+                id INTEGER PRIMARY KEY,
+                local_path TEXT NOT NULL,
+                s3_path TEXT NOT NULL,
+                size INTEGER NOT NULL,
+                last_modified TIMESTAMP NOT NULL,
+                checksum TEXT NOT NULL,
+                is_deleted INTEGER DEFAULT 0,
+                last_backup TIMESTAMP,
+                previous_path TEXT,
+                moved_in_s3 INTEGER DEFAULT 0,
+                UNIQUE(local_path)
+            )
+            ''')
+            
+            # Create backup_runs table to track each backup operation
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS backup_runs (
+                id INTEGER PRIMARY KEY,
+                start_time TIMESTAMP NOT NULL,
+                end_time TIMESTAMP,
+                status TEXT,
+                files_processed INTEGER DEFAULT 0,
+                files_uploaded INTEGER DEFAULT 0,
+                bytes_uploaded INTEGER DEFAULT 0,
+                files_failed INTEGER DEFAULT 0
+            )
+            ''')
+            
+            # Index for faster lookups
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_local_path ON files (local_path)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_is_deleted ON files (is_deleted)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_checksum ON files (checksum)')  # Add index for checksum lookups
+            
+            # Check if moved_in_s3 column exists (for backward compatibility)
+            cursor.execute("PRAGMA table_info(files)")
+            columns = [column[1] for column in cursor.fetchall()]
+            
+            # If moved_in_s3 column is missing, add it and mark all files with a previous_path
+            if 'moved_in_s3' not in columns:
+                try:
+                    logger.info("Adding moved_in_s3 column to files table")
+                    cursor.execute("ALTER TABLE files ADD COLUMN moved_in_s3 INTEGER DEFAULT 0")
+                    cursor.execute("UPDATE files SET moved_in_s3 = 1 WHERE previous_path IS NOT NULL")
+                    logger.info(f"Marked {cursor.rowcount} existing moved files")
+                    self.conn.commit()
+                except sqlite3.Error as e:
+                    logger.error(f"Error adding moved_in_s3 column: {str(e)}")
+            
+            self.conn.commit()
+            logger.info("Database initialized successfully")
         except sqlite3.Error as e:
             logger.error(f"Database initialization error: {str(e)}")
-            with self.lock:
-                if self.conn:
-                    self.conn.close()
-                    self.conn = None
+            if self.conn:
+                self.conn.close()
             raise
     
     def close(self):
         """Close the database connection."""
-        with self.lock:
-            if self.conn:
-                self.conn.close()
-                self.conn = None
+        if self.conn:
+            self.conn.close()
     
     def add_file(self, local_path, s3_path, size, last_modified, checksum, previous_path=None, moved_in_s3=0):
         """Add or update a file in the index."""
         try:
-            with self.lock:
-                conn = self.get_connection()
-                cursor = conn.cursor()
-                now = datetime.datetime.now()
-                
-                cursor.execute('''
-                INSERT INTO files (local_path, s3_path, size, last_modified, checksum, last_backup, previous_path, moved_in_s3)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(local_path) DO UPDATE SET
-                    s3_path=excluded.s3_path,
-                    size=excluded.size,
-                    last_modified=excluded.last_modified,
-                    checksum=excluded.checksum,
-                    is_deleted=0,
-                    last_backup=excluded.last_backup,
-                    previous_path=excluded.previous_path,
-                    moved_in_s3=excluded.moved_in_s3
-                ''', (local_path, s3_path, size, last_modified, checksum, now, previous_path, moved_in_s3))
-                
-                conn.commit()
-                return True
+            cursor = self.conn.cursor()
+            now = datetime.datetime.now()
+            
+            cursor.execute('''
+            INSERT INTO files (local_path, s3_path, size, last_modified, checksum, last_backup, previous_path, moved_in_s3)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(local_path) DO UPDATE SET
+                s3_path=excluded.s3_path,
+                size=excluded.size,
+                last_modified=excluded.last_modified,
+                checksum=excluded.checksum,
+                is_deleted=0,
+                last_backup=excluded.last_backup,
+                previous_path=excluded.previous_path,
+                moved_in_s3=excluded.moved_in_s3
+            ''', (local_path, s3_path, size, last_modified, checksum, now, previous_path, moved_in_s3))
+            
+            self.conn.commit()
+            return True
         except sqlite3.Error as e:
             logger.error(f"Error adding file to database: {str(e)}")
             return False
@@ -437,14 +423,12 @@ class DatabaseManager:
     def mark_deleted(self, local_path):
         """Mark a file as deleted in the local index."""
         try:
-            with self.lock:
-                conn = self.get_connection()
-                cursor = conn.cursor()
-                cursor.execute('''
-                UPDATE files SET is_deleted=1 WHERE local_path=?
-                ''', (local_path,))
-                conn.commit()
-                return cursor.rowcount > 0
+            cursor = self.conn.cursor()
+            cursor.execute('''
+            UPDATE files SET is_deleted=1 WHERE local_path=?
+            ''', (local_path,))
+            self.conn.commit()
+            return cursor.rowcount > 0
         except sqlite3.Error as e:
             logger.error(f"Error marking file as deleted: {str(e)}")
             return False
@@ -452,14 +436,12 @@ class DatabaseManager:
     def get_file_by_path(self, local_path):
         """Get file information by local path."""
         try:
-            with self.lock:
-                conn = self.get_connection()
-                cursor = conn.cursor()
-                cursor.execute('''
-                SELECT id, local_path, s3_path, size, last_modified, checksum, is_deleted, last_backup
-                FROM files WHERE local_path=?
-                ''', (local_path,))
-                return cursor.fetchone()
+            cursor = self.conn.cursor()
+            cursor.execute('''
+            SELECT id, local_path, s3_path, size, last_modified, checksum, is_deleted, last_backup
+            FROM files WHERE local_path=?
+            ''', (local_path,))
+            return cursor.fetchone()
         except sqlite3.Error as e:
             logger.error(f"Error fetching file: {str(e)}")
             return None
@@ -467,14 +449,12 @@ class DatabaseManager:
     def get_file_by_checksum(self, checksum):
         """Get file information by checksum."""
         try:
-            with self.lock:
-                conn = self.get_connection()
-                cursor = conn.cursor()
-                cursor.execute('''
-                SELECT id, local_path, s3_path, size, last_modified, checksum, is_deleted, last_backup
-                FROM files WHERE checksum=? AND is_deleted=0 LIMIT 1
-                ''', (checksum,))
-                return cursor.fetchone()
+            cursor = self.conn.cursor()
+            cursor.execute('''
+            SELECT id, local_path, s3_path, size, last_modified, checksum, is_deleted, last_backup
+            FROM files WHERE checksum=? AND is_deleted=0 LIMIT 1
+            ''', (checksum,))
+            return cursor.fetchone()
         except sqlite3.Error as e:
             logger.error(f"Error fetching file by checksum: {str(e)}")
             return None
@@ -482,20 +462,18 @@ class DatabaseManager:
     def get_all_files(self, include_deleted=False):
         """Get all files from the index."""
         try:
-            with self.lock:
-                conn = self.get_connection()
-                cursor = conn.cursor()
-                if include_deleted:
-                    cursor.execute('''
-                    SELECT id, local_path, s3_path, size, last_modified, checksum, is_deleted, last_backup
-                    FROM files
-                    ''')
-                else:
-                    cursor.execute('''
-                    SELECT id, local_path, s3_path, size, last_modified, checksum, is_deleted, last_backup
-                    FROM files WHERE is_deleted=0
-                    ''')
-                return cursor.fetchall()
+            cursor = self.conn.cursor()
+            if include_deleted:
+                cursor.execute('''
+                SELECT id, local_path, s3_path, size, last_modified, checksum, is_deleted, last_backup
+                FROM files
+                ''')
+            else:
+                cursor.execute('''
+                SELECT id, local_path, s3_path, size, last_modified, checksum, is_deleted, last_backup
+                FROM files WHERE is_deleted=0
+                ''')
+            return cursor.fetchall()
         except sqlite3.Error as e:
             logger.error(f"Error fetching files: {str(e)}")
             return []
@@ -503,14 +481,12 @@ class DatabaseManager:
     def get_deleted_files(self):
         """Get all files marked as deleted."""
         try:
-            with self.lock:
-                conn = self.get_connection()
-                cursor = conn.cursor()
-                cursor.execute('''
-                SELECT id, local_path, s3_path, size, last_modified, checksum, is_deleted, last_backup
-                FROM files WHERE is_deleted=1
-                ''')
-                return cursor.fetchall()
+            cursor = self.conn.cursor()
+            cursor.execute('''
+            SELECT id, local_path, s3_path, size, last_modified, checksum, is_deleted, last_backup
+            FROM files WHERE is_deleted=1
+            ''')
+            return cursor.fetchall()
         except sqlite3.Error as e:
             logger.error(f"Error fetching deleted files: {str(e)}")
             return []
@@ -518,16 +494,14 @@ class DatabaseManager:
     def start_backup_run(self):
         """Start a new backup run and return its ID."""
         try:
-            with self.lock:
-                conn = self.get_connection()
-                cursor = conn.cursor()
-                now = datetime.datetime.now()
-                cursor.execute('''
-                INSERT INTO backup_runs (start_time, status)
-                VALUES (?, 'RUNNING')
-                ''', (now,))
-                conn.commit()
-                return cursor.lastrowid
+            cursor = self.conn.cursor()
+            now = datetime.datetime.now()
+            cursor.execute('''
+            INSERT INTO backup_runs (start_time, status)
+            VALUES (?, 'RUNNING')
+            ''', (now,))
+            self.conn.commit()
+            return cursor.lastrowid
         except sqlite3.Error as e:
             logger.error(f"Error starting backup run: {str(e)}")
             return None
@@ -535,22 +509,20 @@ class DatabaseManager:
     def finish_backup_run(self, run_id, status, files_processed, files_uploaded, bytes_uploaded, files_failed):
         """Mark a backup run as finished with statistics."""
         try:
-            with self.lock:
-                conn = self.get_connection()
-                cursor = conn.cursor()
-                now = datetime.datetime.now()
-                cursor.execute('''
-                UPDATE backup_runs SET
-                    end_time=?,
-                    status=?,
-                    files_processed=?,
-                    files_uploaded=?,
-                    bytes_uploaded=?,
-                    files_failed=?
-                WHERE id=?
-                ''', (now, status, files_processed, files_uploaded, bytes_uploaded, files_failed, run_id))
-                conn.commit()
-                return True
+            cursor = self.conn.cursor()
+            now = datetime.datetime.now()
+            cursor.execute('''
+            UPDATE backup_runs SET
+                end_time=?,
+                status=?,
+                files_processed=?,
+                files_uploaded=?,
+                bytes_uploaded=?,
+                files_failed=?
+            WHERE id=?
+            ''', (now, status, files_processed, files_uploaded, bytes_uploaded, files_failed, run_id))
+            self.conn.commit()
+            return True
         except sqlite3.Error as e:
             logger.error(f"Error finishing backup run: {str(e)}")
             return False
@@ -832,23 +804,6 @@ class S3Manager:
         except botocore.exceptions.ClientError as e:
             logger.error(f"Error deleting S3 object {s3_key}: {str(e)}")
             return False
-            
-    def check_object_exists(self, s3_key):
-        """Check if an object exists in S3."""
-        try:
-            self.s3_client.head_object(
-                Bucket=self.config.s3_bucket,
-                Key=s3_key
-            )
-            return True
-        except botocore.exceptions.ClientError as e:
-            # If a 404 error is returned, the object doesn't exist
-            if e.response['Error']['Code'] == '404':
-                return False
-            else:
-                logger.error(f"Error checking S3 object {s3_key}: {str(e)}")
-                # For other errors, assume the object doesn't exist to be safe
-                return False
     
     def generate_s3_key(self, file_info):
         """Generate an S3 key for a file based on its local path."""
@@ -917,16 +872,14 @@ class BackupManager:
                 try:
                     if scanner.connect():
                         # Get all non-deleted files for this share
-                        with self.db_manager.lock:
-                            conn = self.db_manager.get_connection()
-                            cursor = conn.cursor()
-                            cursor.execute('''
-                            SELECT id, local_path, s3_path, size, last_modified, checksum, is_deleted
-                            FROM files 
-                            WHERE local_path LIKE ? AND is_deleted=0
-                            ''', (f"{share_config['local_name']}:%",))
-                            
-                            files = cursor.fetchall()
+                        cursor = self.db_manager.conn.cursor()
+                        cursor.execute('''
+                        SELECT id, local_path, s3_path, size, last_modified, checksum, is_deleted
+                        FROM files 
+                        WHERE local_path LIKE ? AND is_deleted=0
+                        ''', (f"{share_config['local_name']}:%",))
+                        
+                        files = cursor.fetchall()
                         
                         # Check if each file still exists
                         for file in files:
@@ -1032,14 +985,12 @@ class BackupManager:
                         
                         if checksum_match:
                             # Get existing record to check if it's already been moved in S3
-                            with self.db_manager.lock:
-                                conn = self.db_manager.get_connection()
-                                cursor = conn.cursor()
-                                cursor.execute('''
-                                SELECT moved_in_s3 FROM files WHERE local_path=?
-                                ''', (file_info['local_path'],))
-                                result = cursor.fetchone()
-                                already_moved = result and result[0] == 1
+                            cursor = self.db_manager.conn.cursor()
+                            cursor.execute('''
+                            SELECT moved_in_s3 FROM files WHERE local_path=?
+                            ''', (file_info['local_path'],))
+                            result = cursor.fetchone()
+                            already_moved = result and result[0] == 1
                             
                             # This is likely a moved file - update S3 to match if not already moved
                             old_path = checksum_match[1]
@@ -1089,7 +1040,7 @@ class BackupManager:
                             continue
                     
                     # If file changed or is new (and not moved/renamed), mark it for upload
-                    if not existing_file or existing_file[5] != file_info['checksum']:
+                    if not existing_file or existing_file[5] != file_info['checksum']:  # Fixed index from 4 to 5
                         files_changed += 1
                         yield file_info, s3_key
             finally:
@@ -1317,23 +1268,21 @@ class BackupManager:
         
         # Step 3: Mark files that exist in S3 but not in shares as "s3_only"
         # First, get all files with placeholder checksums
-        with self.db_manager.lock:
-            conn = self.db_manager.get_connection()
-            cursor = conn.cursor()
-            cursor.execute("SELECT local_path FROM files WHERE checksum='s3_indexed'")
-            s3_only = cursor.fetchall()
+        cursor = self.db_manager.conn.cursor()
+        cursor.execute("SELECT local_path FROM files WHERE checksum='s3_indexed'")
+        s3_only = cursor.fetchall()
+        
+        for row in s3_only:
+            local_path = row[0]
+            s3_only_files += 1
             
-            for row in s3_only:
-                local_path = row[0]
-                s3_only_files += 1
-                
-                # Update these with a special flag to indicate they're only in S3
-                cursor.execute(
-                    "UPDATE files SET checksum='s3_only' WHERE local_path=?", 
-                    (local_path,)
-                )
-            
-            conn.commit()
+            # Update these with a special flag to indicate they're only in S3
+            cursor.execute(
+                "UPDATE files SET checksum='s3_only' WHERE local_path=?", 
+                (local_path,)
+            )
+        
+        self.db_manager.conn.commit()
         
         # Generate summary report
         report = f"""
@@ -1384,40 +1333,27 @@ Next Steps:
                 writer = csv.writer(csvfile)
                 writer.writerow(['Location', 'Share', 'Path', 'Size', 'Last Modified'])
                 
-                # Use a thread-safe connection
-                with self.db_manager.lock:
-                    conn = self.db_manager.get_connection()
-                    cursor = conn.cursor()
-                    
-                    # Files only in S3
-                    cursor.execute(
-                        "SELECT local_path, s3_path, size, last_modified FROM files WHERE checksum='s3_only'"
-                    )
-                    s3_only_files = cursor.fetchall()
-                    
-                    # Prepare query for new files
-                    new_files_by_share = {}
-                    for share_name, stats in share_stats.items():
-                        if stats['new'] > 0:
-                            cursor.execute(
-                                "SELECT local_path, size, last_modified FROM files WHERE local_path LIKE ? AND checksum != 's3_only' AND checksum != 's3_indexed'",
-                                (f"{share_name}:%",)
-                            )
-                            new_files_by_share[share_name] = cursor.fetchall()
-                
-                # Now write the results outside the lock (to minimize lock time)
-                for row in s3_only_files:
+                # Files only in S3
+                cursor.execute(
+                    "SELECT local_path, s3_path, size, last_modified FROM files WHERE checksum='s3_only'"
+                )
+                for row in cursor.fetchall():
                     local_path, s3_path, size, last_modified = row
                     share_name = local_path.split(':', 1)[0]
                     file_path = local_path.split(':', 1)[1] if ':' in local_path else local_path
                     writer.writerow(['S3 Only', share_name, file_path, size, last_modified])
                 
                 # New files that need to be uploaded
-                for share_name, new_files in new_files_by_share.items():
-                    for row in new_files:
-                        local_path, size, last_modified = row
-                        file_path = local_path.split(':', 1)[1] if ':' in local_path else local_path
-                        writer.writerow(['To Upload', share_name, file_path, size, last_modified])
+                for share_name, stats in share_stats.items():
+                    if stats['new'] > 0:
+                        cursor.execute(
+                            "SELECT local_path, size, last_modified FROM files WHERE local_path LIKE ? AND checksum != 's3_only' AND checksum != 's3_indexed'",
+                            (f"{share_name}:%",)
+                        )
+                        for row in cursor.fetchall():
+                            local_path, size, last_modified = row
+                            file_path = local_path.split(':', 1)[1] if ':' in local_path else local_path
+                            writer.writerow(['To Upload', share_name, file_path, size, last_modified])
             
             logger.info(f"Detailed report saved to {report_file}")
         except Exception as e:
@@ -1467,204 +1403,6 @@ Next Steps:
             logger.error(f"Error uploading {file_info['local_path']}: {str(e)}")
             return False
     
-    def verify_and_upload_missing(self):
-        """
-        Verify files in the index exist in S3 and upload any missing files.
-        This is useful when the index database exists but files might not have been uploaded.
-        """
-        logger.info("Starting verification of index against S3 objects...")
-        
-        # Start tracking the backup run
-        run_id = self.db_manager.start_backup_run()
-        
-        # Initialize counters
-        files_processed = 0
-        files_uploaded = 0
-        bytes_uploaded = 0
-        files_failed = 0
-        
-        # Prepare success/failure records for reporting
-        success_records = []
-        failure_records = []
-        
-        # Get all non-deleted files from the database
-        all_files = self.db_manager.get_all_files(include_deleted=False)
-        total_files = len(all_files)
-        logger.info(f"Found {total_files} files in the index to verify")
-        
-        # Create a thread pool for parallel uploads
-        with ThreadPoolExecutor(max_workers=self.config.thread_count) as executor:
-            # Dictionary to track futures
-            future_to_file = {}
-            
-            # Check each file in the index
-            for file_record in all_files:
-                file_id, local_path, s3_path, size, last_modified, checksum, is_deleted, last_backup = file_record
-                files_processed += 1
-                
-                # Skip deleted files
-                if is_deleted:
-                    continue
-                
-                # Check if file exists in S3
-                if not self.s3_manager.check_object_exists(s3_path):
-                    logger.info(f"File in index but not in S3: {local_path} -> {s3_path}")
-                    
-                    # Parse the local path to get share name and path
-                    parts = local_path.split(':', 1)
-                    if len(parts) != 2:
-                        logger.warning(f"Invalid path format: {local_path}")
-                        continue
-                    
-                    share_name, file_path = parts
-                    
-                    # Find matching share config
-                    share_config = None
-                    for share in self.config.shares:
-                        if share['local_name'] == share_name:
-                            share_config = share
-                            break
-                    
-                    if not share_config:
-                        logger.warning(f"Share {share_name} not found in configuration")
-                        continue
-                    
-                    # Create file_info object for upload
-                    scanner = ShareScanner(share_config, self.db_manager)
-                    try:
-                        if scanner.connect():
-                            try:
-                                # Download to temp file for checksum calculation
-                                temp_path = scanner.get_temp_file(file_path, os.path.basename(file_path))
-                                
-                                # Verify checksum matches what's in the database
-                                with open(temp_path, 'rb') as file_obj:
-                                    actual_checksum = scanner.calculate_checksum(file_obj)
-                                
-                                # If checksum has changed, update the database
-                                if actual_checksum != checksum:
-                                    logger.info(f"File checksum changed: {local_path}")
-                                    checksum = actual_checksum
-                                
-                                # Create file_info for uploading
-                                file_info = {
-                                    'local_path': local_path,
-                                    'share_path': file_path,
-                                    'size': size,
-                                    'last_modified': datetime.datetime.fromisoformat(last_modified),
-                                    'checksum': checksum,
-                                    'share_config': share_config
-                                }
-                                
-                                # Submit for upload
-                                future = executor.submit(self.upload_file_to_s3, file_info, s3_path)
-                                future_to_file[future] = (file_info, s3_path, temp_path)
-                                
-                            except Exception as e:
-                                logger.error(f"Error processing file {file_path}: {str(e)}")
-                                # Add to failure records
-                                failure_records.append({
-                                    'name': os.path.basename(file_path),
-                                    'local_path': local_path,
-                                    's3_path': s3_path,
-                                    'size': size,
-                                    'error': f"Error accessing file: {str(e)}"
-                                })
-                                files_failed += 1
-                    finally:
-                        scanner.disconnect()
-                
-                # Log progress every 100 files
-                if files_processed % 100 == 0:
-                    logger.info(f"Verified {files_processed}/{total_files} files")
-            
-            # Process completed uploads
-            for future in future_to_file:
-                file_info, s3_key, temp_path = future_to_file[future]
-                
-                try:
-                    # Remove temp file regardless of upload success
-                    if os.path.exists(temp_path):
-                        os.unlink(temp_path)
-                    
-                    success = future.result()
-                    
-                    if success:
-                        files_uploaded += 1
-                        bytes_uploaded += file_info['size']
-                        
-                        # Update the database after successful upload
-                        self.db_manager.add_file(
-                            local_path=file_info['local_path'],
-                            s3_path=s3_key,
-                            size=file_info['size'],
-                            last_modified=file_info['last_modified'].isoformat(),
-                            checksum=file_info['checksum'],
-                            previous_path=None,
-                            moved_in_s3=0
-                        )
-                        
-                        # Add to success records
-                        success_records.append({
-                            'name': os.path.basename(file_info['share_path']),
-                            'local_path': file_info['local_path'],
-                            's3_path': s3_key,
-                            'size': file_info['size']
-                        })
-                    else:
-                        files_failed += 1
-                        
-                        # Add to failure records
-                        failure_records.append({
-                            'name': os.path.basename(file_info['share_path']),
-                            'local_path': file_info['local_path'],
-                            's3_path': s3_key,
-                            'size': file_info['size'],
-                            'error': 'Upload failed'
-                        })
-                except Exception as e:
-                    files_failed += 1
-                    
-                    # Add to failure records
-                    failure_records.append({
-                        'name': os.path.basename(file_info['share_path']),
-                        'local_path': file_info['local_path'],
-                        's3_path': s3_key,
-                        'size': file_info['size'],
-                        'error': str(e)
-                    })
-        
-        # Update backup run status
-        status = 'COMPLETED' if files_failed == 0 else 'COMPLETED_WITH_ERRORS'
-        self.db_manager.finish_backup_run(
-            run_id, status, files_processed, files_uploaded, bytes_uploaded, files_failed
-        )
-        
-        # Generate report
-        self.generate_report(success_records, failure_records)
-        
-        # Add run details
-        now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        details = f"""
-VERIFICATION SUMMARY ({now})
-=======================
-Files verified: {files_processed}
-Files missing in S3: {len(future_to_file)}
-Files successfully uploaded: {files_uploaded} ({format_size(bytes_uploaded)})
-Files failed: {files_failed}
-Status: {status}
-        """
-        
-        logger.info(details)
-        print(details)
-        
-        # Send email notification if enabled
-        if self.config.email_enabled:
-            self.send_email(
-                subject=f"Verification Summary - {status}",
-                body=details
-            )
-    
     def run_backup(self):
         """Run a full backup process and update index database."""
         logger.info("Starting backup process")
@@ -1697,8 +1435,17 @@ Status: {status}
                 future = executor.submit(self.upload_file_to_s3, file_info, s3_key)
                 future_to_file[future] = (file_info, s3_key)
                 
-                # Don't update the database yet - we'll do it after successful upload
-                # This prevents the file from being marked as backed up until it's actually uploaded
+                # Always update the index database with the current file information
+                # This ensures all scanned files are indexed, even if upload is skipped or fails
+                self.db_manager.add_file(
+                    local_path=file_info['local_path'],
+                    s3_path=s3_key,
+                    size=file_info['size'],
+                    last_modified=file_info['last_modified'].isoformat(),
+                    checksum=file_info['checksum'],
+                    previous_path=None,
+                    moved_in_s3=0
+                )
             
             # Process completed uploads
             for future in future_to_file:
@@ -1710,17 +1457,6 @@ Status: {status}
                     if success:
                         files_uploaded += 1
                         bytes_uploaded += file_info['size']
-                        
-                        # Update the database after successful upload
-                        self.db_manager.add_file(
-                            local_path=file_info['local_path'],
-                            s3_path=s3_key,
-                            size=file_info['size'],
-                            last_modified=file_info['last_modified'].isoformat(),
-                            checksum=file_info['checksum'],
-                            previous_path=None,
-                            moved_in_s3=0
-                        )
                         
                         # Add to success records
                         success_records.append({
@@ -2237,8 +1973,6 @@ def main():
     parser.add_argument('--password-file', help='File containing the password for encryption/decryption')
     parser.add_argument('--password-env', help='Environment variable name containing the password')
     parser.add_argument('--run-now', action='store_true', help='Run backup immediately')
-    parser.add_argument('--run-now-verify', action='store_true', 
-                        help='Run backup with S3 verification (uploads files in index that are missing from S3)')
     parser.add_argument('--schedule', action='store_true', help='Run scheduled backups')
     parser.add_argument('--test-connection', action='store_true', help='Test connection to Windows shares')
     parser.add_argument('--list-index', action='store_true', help='List the contents of the backup index')
@@ -2385,14 +2119,6 @@ def main():
     # Run backup immediately if requested
     if args.run_now:
         run_scheduled_backup(config)
-    
-    # Run backup with verification if requested
-    if args.run_now_verify:
-        backup_manager = BackupManager(config)
-        try:
-            backup_manager.verify_and_upload_missing()
-        finally:
-            backup_manager.close()
     
     # Set up scheduled backups if requested
     if args.schedule:
