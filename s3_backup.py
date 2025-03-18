@@ -1087,65 +1087,16 @@ class BackupManager:
         return deleted_count
     
     def build_initial_index(self):
-        """Build initial index from S3 and Windows shares without uploading."""
-        logger.info("Building initial index...")
+        """Build initial index from Windows shares only without uploading."""
+        logger.info("Building initial index from Windows shares only...")
         
         # Initialize counters
         files_indexed = 0
         
-        # First, index files from S3
-        logger.info("Indexing files from S3...")
-        
-        try:
-            for obj in self.s3_manager.list_objects():
-                s3_key = obj['Key']
-                
-                # If a prefix is configured, we need to skip objects that don't match it
-                if self.config.s3_prefix:
-                    prefix = self.config.s3_prefix.rstrip('/')
-                    if not s3_key.startswith(prefix + '/'):
-                        continue
-                    # Extract share name and path from S3 key with prefix
-                    # Format: prefix/share_name/path/to/file
-                    path_parts = s3_key[len(prefix) + 1:].split('/', 1)
-                else:
-                    # No prefix, so format is: share_name/path/to/file
-                    path_parts = s3_key.split('/', 1)
-                
-                if len(path_parts) != 2:
-                    continue
-                
-                share_name, file_path = path_parts
-                local_path = f"{share_name}:{file_path}"
-                
-                # Add to database without checksum (will be updated later if file exists)
-                self.db_manager.add_file(
-                    local_path=local_path,
-                    s3_path=s3_key,
-                    size=obj['Size'],
-                    last_modified=obj['LastModified'].isoformat(),
-                    checksum="s3_indexed",  # Placeholder
-                    previous_path=None,
-                    moved_in_s3=0
-                )
-                
-                files_indexed += 1
-                
-                if files_indexed % 1000 == 0:
-                    logger.info(f"Indexed {files_indexed} files from S3 so far")
-        
-        except Exception as e:
-            logger.error(f"Error indexing S3: {str(e)}")
-        
-        logger.info(f"Indexed {files_indexed} files from S3")
-        
-        # Now scan shares to update checksums and find new files
-        logger.info("Scanning Windows shares to update index...")
+        # Scan shares to find files
+        logger.info("Scanning Windows shares to build index...")
         
         for file_info, s3_key in self.scan_shares():
-            # Check if this file is already in the index (from S3)
-            existing = self.db_manager.get_file_by_path(file_info['local_path'])
-            
             # Update database with current file information
             self.db_manager.add_file(
                 local_path=file_info['local_path'],
@@ -1156,6 +1107,13 @@ class BackupManager:
                 previous_path=None,
                 moved_in_s3=0
             )
+            
+            files_indexed += 1
+            
+            if files_indexed % 1000 == 0:
+                logger.info(f"Indexed {files_indexed} files so far")
+        
+        logger.info(f"Indexed {files_indexed} files from Windows shares")
         
         # Mark files that no longer exist as deleted
         self.mark_deleted_files()
