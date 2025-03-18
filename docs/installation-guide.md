@@ -59,6 +59,8 @@ sudo yum install -y python3 python3-pip python3-devel samba-client-libs samba-cl
    EOF
 
    chmod +x s3backup.sh
+   # Deactivate the virtual environment after setup
+   deactivate
    ```
 
 6. Create a default configuration:
