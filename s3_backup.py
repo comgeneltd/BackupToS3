@@ -338,7 +338,7 @@ class DatabaseManager:
                 self.conn = sqlite3.connect(self.db_path)
                 cursor = self.conn.cursor()
                 
-                # Create files table with file_name column
+                # Create files table with uploaded_to_s3 column
                 cursor.execute('''
                 CREATE TABLE IF NOT EXISTS files (
                     id INTEGER PRIMARY KEY,
@@ -352,6 +352,7 @@ class DatabaseManager:
                     previous_path TEXT,
                     moved_in_s3 INTEGER DEFAULT 0,
                     file_name TEXT,
+                    uploaded_to_s3 INTEGER DEFAULT 0,
                     UNIQUE(local_path)
                 )
                 ''')
@@ -375,6 +376,7 @@ class DatabaseManager:
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_is_deleted ON files (is_deleted)')
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_checksum ON files (checksum)')  # Add index for checksum lookups
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_file_name ON files (file_name)')  # Add index for file_name lookups
+                cursor.execute('CREATE INDEX IF NOT EXISTS idx_uploaded_to_s3 ON files (uploaded_to_s3)')  # Add index for uploaded_to_s3 lookups
                 
                 # Check for columns needing migration
                 cursor.execute("PRAGMA table_info(files)")
@@ -390,6 +392,16 @@ class DatabaseManager:
                         self.conn.commit()
                     except sqlite3.Error as e:
                         logger.error(f"Error adding moved_in_s3 column: {str(e)}")
+                
+                # If uploaded_to_s3 column is missing, add it
+                if 'uploaded_to_s3' not in columns:
+                    try:
+                        logger.info("Adding uploaded_to_s3 column to files table")
+                        cursor.execute("ALTER TABLE files ADD COLUMN uploaded_to_s3 INTEGER DEFAULT 0")
+                        logger.info("All existing files will be marked as not confirmed in S3")
+                        self.conn.commit()
+                    except sqlite3.Error as e:
+                        logger.error(f"Error adding uploaded_to_s3 column: {str(e)}")
                 
                 # If file_name column is missing, add it and populate from local_path
                 if 'file_name' not in columns:
@@ -431,7 +443,7 @@ class DatabaseManager:
                 self.conn.close()
                 self.conn = None
     
-    def add_file(self, local_path, s3_path, size, last_modified, checksum, previous_path=None, moved_in_s3=0, file_name=None):
+    def add_file(self, local_path, s3_path, size, last_modified, checksum, previous_path=None, moved_in_s3=0, file_name=None, uploaded_to_s3=0):
         """Add or update a file in the index."""
         try:
             with self.lock:
@@ -445,8 +457,8 @@ class DatabaseManager:
                     file_name = os.path.basename(file_path_part)
                 
                 cursor.execute('''
-                INSERT INTO files (local_path, s3_path, size, last_modified, checksum, last_backup, previous_path, moved_in_s3, file_name)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO files (local_path, s3_path, size, last_modified, checksum, last_backup, previous_path, moved_in_s3, file_name, uploaded_to_s3)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(local_path) DO UPDATE SET
                     s3_path=excluded.s3_path,
                     size=excluded.size,
@@ -456,8 +468,9 @@ class DatabaseManager:
                     last_backup=excluded.last_backup,
                     previous_path=excluded.previous_path,
                     moved_in_s3=excluded.moved_in_s3,
-                    file_name=excluded.file_name
-                ''', (local_path, s3_path, size, last_modified, checksum, now, previous_path, moved_in_s3, file_name))
+                    file_name=excluded.file_name,
+                    uploaded_to_s3=excluded.uploaded_to_s3
+                ''', (local_path, s3_path, size, last_modified, checksum, now, previous_path, moved_in_s3, file_name, uploaded_to_s3))
                 
                 conn.commit()
                 return True
@@ -487,7 +500,7 @@ class DatabaseManager:
                 conn = self.get_connection()
                 cursor = conn.cursor()
                 cursor.execute('''
-                SELECT id, local_path, s3_path, size, last_modified, checksum, is_deleted, last_backup, file_name
+                SELECT id, local_path, s3_path, size, last_modified, checksum, is_deleted, last_backup, file_name, previous_path, moved_in_s3, uploaded_to_s3
                 FROM files WHERE local_path=?
                 ''', (local_path,))
                 return cursor.fetchone()
@@ -502,7 +515,7 @@ class DatabaseManager:
                 conn = self.get_connection()
                 cursor = conn.cursor()
                 cursor.execute('''
-                SELECT id, local_path, s3_path, size, last_modified, checksum, is_deleted, last_backup, file_name
+                SELECT id, local_path, s3_path, size, last_modified, checksum, is_deleted, last_backup, file_name, previous_path, moved_in_s3, uploaded_to_s3
                 FROM files WHERE checksum=? AND is_deleted=0 LIMIT 1
                 ''', (checksum,))
                 return cursor.fetchone()
@@ -518,12 +531,12 @@ class DatabaseManager:
                 cursor = conn.cursor()
                 if include_deleted:
                     cursor.execute('''
-                    SELECT id, local_path, s3_path, size, last_modified, checksum, is_deleted, last_backup, file_name
+                    SELECT id, local_path, s3_path, size, last_modified, checksum, is_deleted, last_backup, file_name, previous_path, moved_in_s3, uploaded_to_s3
                     FROM files
                     ''')
                 else:
                     cursor.execute('''
-                    SELECT id, local_path, s3_path, size, last_modified, checksum, is_deleted, last_backup, file_name
+                    SELECT id, local_path, s3_path, size, last_modified, checksum, is_deleted, last_backup, file_name, previous_path, moved_in_s3, uploaded_to_s3
                     FROM files WHERE is_deleted=0
                     ''')
                 return cursor.fetchall()
@@ -765,9 +778,14 @@ class ShareScanner:
                     # Convert Windows file time to Unix timestamp
                     last_modified = datetime.datetime.fromtimestamp(file_info.last_write_time)
                     
-                    # If file exists in DB and hasn't changed, skip checksum calculation
+                    # Get the uploaded_to_s3 flag (0 = not uploaded, 1 = uploaded)
+                    uploaded_to_s3 = 0
+                    if existing_file and len(existing_file) >= 12:  # Make sure the field exists
+                        uploaded_to_s3 = existing_file[11]
+                        
+                    # Only skip if file exists, hasn't changed AND has been uploaded to S3
                     if existing_file and int(existing_file[3]) == file_info.file_size and \
-                       existing_file[4] == last_modified.isoformat():
+                       existing_file[4] == last_modified.isoformat() and uploaded_to_s3 == 1:
                         continue
                     
                     # For changed or new files, calculate checksum
@@ -1177,8 +1195,13 @@ class BackupManager:
                                 yield file_info, s3_key
                                 continue
                     
-                    # If file changed or is new (and not moved/renamed), mark it for upload
-                    if not existing_file or existing_file[5] != file_info['checksum']:
+                    # If file changed or is new or hasn't been uploaded to S3, mark it for upload
+                    uploaded_to_s3 = 0
+                    if existing_file and len(existing_file) >= 12:  # Make sure the field exists
+                        uploaded_to_s3 = existing_file[11]
+                    
+                    if not existing_file or existing_file[5] != file_info['checksum'] or uploaded_to_s3 == 0:
+                        logger.info(f"File needs upload: {file_info['local_path']} (New: {not existing_file}, Changed: {existing_file and existing_file[5] != file_info['checksum']}, Not uploaded: {uploaded_to_s3 == 0})")
                         files_changed += 1
                         yield file_info, s3_key
             finally:
@@ -1247,6 +1270,7 @@ class BackupManager:
         # Use our modified scan_shares method with skip_move_detection=True to avoid S3 operations
         for file_info, s3_key in self.scan_shares(skip_move_detection=True):
             # Add file to database as a new entry (no previous_path)
+            # Explicitly set uploaded_to_s3=0 to indicate not uploaded
             self.db_manager.add_file(
                 local_path=file_info['local_path'],
                 s3_path=s3_key,
@@ -1254,7 +1278,9 @@ class BackupManager:
                 last_modified=file_info['last_modified'].isoformat(),
                 checksum=file_info['checksum'],
                 previous_path=None,
-                moved_in_s3=0
+                moved_in_s3=0,
+                file_name=file_info.get('file_name'),
+                uploaded_to_s3=0  # Mark as not uploaded
             )
             
             files_indexed += 1
@@ -1264,6 +1290,7 @@ class BackupManager:
         
         logger.info(f"Indexed {files_indexed} files from Windows shares")
         logger.info("Initial index building completed without accessing S3")
+        logger.info("Run --run-now or --run-now-verify to upload files to S3")
     
     def sync_index_with_aws(self):
         """
@@ -1542,7 +1569,7 @@ Next Steps:
                     success = self.s3_manager.upload_file(temp_path, s3_key)
                     
                     if success:
-                        # Update the database
+                        # Update the database - mark as uploaded to S3
                         self.db_manager.add_file(
                             local_path=file_info['local_path'],
                             s3_path=s3_key,
@@ -1551,7 +1578,8 @@ Next Steps:
                             checksum=file_info['checksum'],
                             previous_path=None,
                             moved_in_s3=0,
-                            file_name=file_info.get('file_name', os.path.basename(share_path))
+                            file_name=file_info.get('file_name', os.path.basename(share_path)),
+                            uploaded_to_s3=1  # Mark as uploaded
                         )
                         return True
                     return False
@@ -1606,8 +1634,13 @@ Next Steps:
                 if is_deleted:
                     continue
                 
-                # Check if file exists in S3
-                if not self.s3_manager.check_object_exists(s3_path):
+                # Get uploaded_to_s3 flag if it exists
+                uploaded_to_s3 = 0
+                if len(file_record) >= 12:  # Make sure the uploaded_to_s3 field exists
+                    uploaded_to_s3 = file_record[11]
+                
+                # Check if file exists in S3 or hasn't been marked as uploaded
+                if not self.s3_manager.check_object_exists(s3_path) or uploaded_to_s3 == 0:
                     logger.info(f"File in index but not in S3: {local_path} -> {s3_path}")
                     
                     # Parse the local path to get share name and path
