@@ -1728,17 +1728,6 @@ Next Steps:
                         files_uploaded += 1
                         bytes_uploaded += file_info['size']
                         
-                        # Update the database after successful upload
-                        self.db_manager.add_file(
-                            local_path=file_info['local_path'],
-                            s3_path=s3_key,
-                            size=file_info['size'],
-                            last_modified=file_info['last_modified'].isoformat(),
-                            checksum=file_info['checksum'],
-                            previous_path=None,
-                            moved_in_s3=0,
-                            file_name=file_info['file_name']
-                        )
                         
                         # Add to success records
                         success_records.append({
@@ -1847,16 +1836,7 @@ Status: {status}
                         files_uploaded += 1
                         bytes_uploaded += file_info['size']
                         
-                        # Update the database after successful upload
-                        self.db_manager.add_file(
-                            local_path=file_info['local_path'],
-                            s3_path=s3_key,
-                            size=file_info['size'],
-                            last_modified=file_info['last_modified'].isoformat(),
-                            checksum=file_info['checksum'],
-                            previous_path=None,
-                            moved_in_s3=0
-                        )
+
                         
                         # Add to success records
                         success_records.append({
