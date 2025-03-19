@@ -11,7 +11,7 @@
 # Run backup immediately
 ./s3backup.sh --run-now
 
-# Verify files in index exist in S3 without running a backup
+# Verify files in index exist in S3 and upload missing files
 ./s3backup.sh --run-now-verify
 
 # Start built-in scheduler (uses scan_interval from config.ini)
