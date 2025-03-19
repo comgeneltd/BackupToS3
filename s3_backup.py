@@ -2476,15 +2476,18 @@ def main():
     if args.generate_delete_script:
         generate_s3_delete_script(config, args.script_path)
         return
-    
     # Initialize database and build initial index if requested
     if args.initialize:
-        backup_manager = BackupManager(config)
-        try:
-            backup_manager.build_initial_index()
-        finally:
-            backup_manager.close()
-    
+    	backup_manager = BackupManager(config)
+    	try:
+        backup_manager.build_initial_index()
+        
+        # Run a backup to upload all indexed files
+        print("Initial index built. Now uploading all files to S3...")
+        logger.info("Initial index built. Now uploading all files to S3...")
+        backup_manager.run_backup()
+    finally:
+        backup_manager.close()    
     # Run backup immediately if requested
     if args.run_now:
         run_scheduled_backup(config)
