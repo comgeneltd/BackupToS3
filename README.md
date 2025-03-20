@@ -1,15 +1,18 @@
-# S3 Windows Share Backup Tool
+# S3 Windows Share Sync Tool
 
-A tool for backing up Windows shares to S3 storage with local indexing.
+A tool for automatic uploading files from Windows shares to S3 storage with local indexing.
+Compared to AWS DataSync:
+    1. Zero transfer fees.
+    2. No API calls to list whole S3 on each job execution
+    3. Simple and fast install on your device.
 
 ## Features
 
-- Automatic backup of Windows SMB/CIFS shares to Amazon S3
+- Automatic sync of Windows SMB/CIFS shares to Amazon S3
 - Local SQLite database for tracking file changes
-- Deduplication of files using checksum comparison
+- Duplicate files detection by using checksum comparison
 - Support for encrypted configuration to protect credentials
-- Scheduling capabilities for automated backups
-- Verification of backups to ensure data integrity
+- Scheduling capabilities for automated jobs
 - Detailed reports and logging
 - Intelligent multipart uploads for large files
 - Configurable concurrency settings for improved performance
