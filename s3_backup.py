@@ -17,6 +17,7 @@ import configparser
 import base64
 import getpass
 import smtplib
+import io
 from email.message import EmailMessage
 from io import StringIO
 from pathlib import Path
@@ -115,6 +116,7 @@ class Config:
         self.password = password
         self.salt = None
         self.encrypted = False
+        self.use_xxhash = False  # Default to not use xxhash for compatibility
         
         # Try to load salt if it exists
         salt_file = os.path.join(os.path.dirname(config_file), CONFIG_SALT_FILE)
@@ -127,9 +129,16 @@ class Config:
         
         # Default values
         self.aws_access_key = ''
+        self.multipart_threshold = 8 * 1024 * 1024  # 8MB default
+        self.multipart_max_concurrent = 4  # Default concurrent part uploads
+        self.large_file_threshold = 1024 * 1024 * 1024  # 1GB default
+        self.checksum_parallel_threshold = 100 * 1024 * 1024  # 100MB default
+        self.checksum_parallel_processes = None  # Default to CPU count
+        self.direct_upload_threshold = 500 * 1024 * 1024  # 500MB default - files larger than this use direct streaming
         self.aws_secret_key = ''
         self.aws_region = 'us-east-1'
         self.s3_bucket = ''
+        self.checksum_retry_count = 3  # Default number of retries for checksum calculation
         self.s3_prefix = ''  # No prefix by default
         self.storage_class = 'STANDARD_IA'  # Default storage class
         self.db_path = 'backup_index.db'
@@ -206,6 +215,16 @@ class Config:
                 self.report_path = self.config['General'].get('report_path', 'reports/')
                 self.scan_interval = int(self.config['General'].get('scan_interval', '24'))
                 self.thread_count = int(self.config['General'].get('thread_count', '4'))
+                self.multipart_threshold = int(self.config['General'].get('multipart_threshold', str(8 * 1024 * 1024)))
+                self.multipart_max_concurrent = int(self.config['General'].get('multipart_max_concurrent', '4'))
+                self.large_file_threshold = int(self.config['General'].get('large_file_threshold', str(1024 * 1024 * 1024)))
+                self.checksum_parallel_threshold = int(self.config['General'].get('checksum_parallel_threshold', str(100 * 1024 * 1024)))
+                self.direct_upload_threshold = int(self.config['General'].get('direct_upload_threshold', str(500 * 1024 * 1024)))
+                self.checksum_parallel_processes = self.config['General'].get('checksum_parallel_processes', None)
+                if self.checksum_parallel_processes:
+                    self.checksum_parallel_processes = int(self.checksum_parallel_processes)
+                self.use_xxhash = self.config['General'].getboolean('use_xxhash', False)
+                self.checksum_retry_count = int(self.config['General'].get('checksum_retry_count', '3'))
             
             # Email notification settings
             if 'Email' in self.config:
@@ -251,7 +270,15 @@ class Config:
             'db_path': 'backup_index.db',
             'report_path': 'reports/',
             'scan_interval': '24',
-            'thread_count': '4'
+            'thread_count': '4',
+            'multipart_threshold': '8388608',  # 8MB in bytes
+            'multipart_max_concurrent': '4',    # Maximum concurrent part uploads
+            'large_file_threshold': '1073741824',  # 1GB in bytes
+            'checksum_parallel_threshold': '104857600',  # 100MB in bytes
+            'direct_upload_threshold': '524288000',  # 500MB in bytes
+            'checksum_parallel_processes': '',  # Empty means use CPU count
+            'use_xxhash': 'false',  # Set to 'true' for faster checksums (requires xxhash package)
+            'checksum_retry_count': '3'  # Number of retries for checksum calculation
         }
         
         self.config['Email'] = {
@@ -319,8 +346,9 @@ For automated/scheduled operations with encrypted config:
 class DatabaseManager:
     """Manager for the local index database."""
     
-    def __init__(self, db_path):
+    def __init__(self, db_path, config=None):
         self.db_path = db_path
+        self.config = config  # Store the config object
         self.conn = None
         self.lock = threading.RLock()  # Reentrant lock for thread safety
         self.initialize_db()
@@ -706,6 +734,390 @@ class ShareScanner:
         for chunk in iter(lambda: file_obj.read(4096), b''):
             md5.update(chunk)
         return md5.hexdigest()
+        
+    def calculate_parallel_checksum(self, file_path, num_processes=None):
+        """Calculate MD5 checksum using parallel processing for large files."""
+        import multiprocessing
+        
+        if num_processes is None:
+            num_processes = multiprocessing.cpu_count()
+        
+        file_size = os.path.getsize(file_path)
+        chunk_size = max(file_size // num_processes, 5*1024*1024)  # At least 5MB chunks
+        
+        # Create chunks based on file size
+        chunks = []
+        for i in range(0, file_size, chunk_size):
+            chunks.append((i, min(chunk_size, file_size - i)))
+        
+        # Function to calculate checksum for a chunk
+        def chunk_checksum(start, size):
+            md5 = hashlib.md5()
+            with open(file_path, 'rb') as f:
+                f.seek(start)
+                chunk = f.read(size)
+            md5.update(chunk)
+            return md5.digest()
+        
+        # Process chunks in parallel
+        with multiprocessing.Pool(processes=num_processes) as pool:
+            results = pool.starmap(chunk_checksum, chunks)
+        
+        # Combine checksums
+        final_md5 = hashlib.md5()
+        for digest in results:
+            final_md5.update(digest)
+        
+        return final_md5.hexdigest()
+        
+    def calculate_xxhash(self, file_path, chunk_size=8192):
+        """Use xxHash64 instead of MD5 (5-10x faster)."""
+        try:
+            import xxhash
+            
+            # For local files
+            if os.path.exists(file_path):
+                xxh = xxhash.xxh64()
+                with open(file_path, 'rb') as f:
+                    for chunk in iter(lambda: f.read(chunk_size), b''):
+                        xxh.update(chunk)
+                return xxh.hexdigest()
+            
+            # For SMB paths, use streaming approach
+            elif hasattr(self, 'conn') and self.conn:
+                try:
+                    # Extract share info
+                    if ':' in file_path:
+                        share_name, share_path = self.extract_share_path(file_path)
+                    else:
+                        share_name = self.share_config['name']
+                        share_path = file_path
+                    
+                    # Use a temp file in memory
+                    import tempfile
+                    temp_file = tempfile.SpooledTemporaryFile(max_size=10 * 1024 * 1024)
+                    try:
+                        self.conn.retrieveFile(share_name, share_path, temp_file)
+                        temp_file.seek(0)
+                        
+                        xxh = xxhash.xxh64()
+                        for chunk in iter(lambda: temp_file.read(chunk_size), b''):
+                            xxh.update(chunk)
+                        return xxh.hexdigest()
+                    finally:
+                        temp_file.close()
+                except Exception as e:
+                    logger.error(f"Error in xxhash for SMB file: {e}")
+                    raise
+            else:
+                raise FileNotFoundError(f"File not found: {file_path}")
+                
+        except ImportError:
+            logger.warning("xxhash module not installed. Falling back to MD5.")
+            
+            # For local files
+            if os.path.exists(file_path):
+                with open(file_path, 'rb') as f:
+                    return self.calculate_checksum(f)
+            # For SMB paths
+            else:
+                return self.calculate_streaming_checksum(file_path)
+    
+    def extract_share_path(self, file_path):
+        """Extract share name and relative path from a file path."""
+        # Normalize file path: remove leading/trailing whitespace and ensure forward slashes
+        if file_path:
+            file_path = file_path.strip().replace('\\', '/')
+        
+        # Handle paths in format "sharename:/path/to/file.ext"
+        parts = file_path.split(':', 1)
+        if len(parts) == 2:
+            return parts[0], parts[1]
+        
+        # For paths without colon, use the current SMB share name
+        if hasattr(self, 'share_config') and self.share_config:
+            # Use the actual SMB share name, not the local_name
+            if 'name' in self.share_config:
+                share_name = self.share_config['name']  # 'Share' instead of 'data'
+                logger.debug(f"Using current SMB share '{share_name}' for file: {file_path}")
+                
+                # Make sure file_path doesn't start with a slash to avoid double slashes
+                if file_path.startswith('/'):
+                    file_path = file_path[1:]
+                
+                return share_name, file_path
+        
+        # If we get here, we couldn't determine the share
+        raise ValueError(f"Invalid file path format: {file_path}")
+    
+    def get_smb_file_size(self, file_path):
+        """Get file size for SMB path."""
+        share_name, path = self.extract_share_path(file_path)
+        try:
+            file_info = self.conn.getAttributes(share_name, path)
+            return file_info.file_size
+        except Exception as e:
+            logger.error(f"Error getting SMB file size: {str(e)}")
+            raise
+            
+    def standard_checksum(self, file_path):
+        """Standard (non-optimized) checksum calculation."""
+        # For local files
+        if os.path.exists(file_path):
+            with open(file_path, 'rb') as f:
+                return self.calculate_checksum(f)
+        # For SMB shares
+        else:
+            return self.calculate_streaming_checksum(file_path)
+            
+    def fast_large_file_checksum(self, file_path):
+        """Faster checksum calculation for very large files."""
+        # Check if xxhash should be used (from config)
+        config_allows_xxhash = False
+        
+        # Try to get config from db_manager if available
+        if hasattr(self, 'db_manager') and hasattr(self.db_manager, 'config') and self.db_manager.config:
+            config_allows_xxhash = getattr(self.db_manager.config, 'use_xxhash', False)
+        
+        # Special handling for SMB paths
+        need_local_file = not os.path.exists(file_path)
+        temp_path = None
+        
+        try:
+            # For SMB paths, download to temp first
+            if need_local_file and hasattr(self, 'conn') and self.conn:
+                try:
+                    # Determine the share name based on the path
+                    if ':' in file_path:
+                        share_name, share_path = self.extract_share_path(file_path)
+                    else:
+                        share_name = self.share_config['name']
+                        share_path = file_path
+                    
+                    # Download to temp file
+                    temp_path = self.get_temp_file(share_path, os.path.basename(share_path))
+                    logger.debug(f"Downloaded {file_path} to {temp_path} for fast checksum")
+                    file_path = temp_path
+                except Exception as e:
+                    logger.error(f"Error downloading file for fast checksum: {e}")
+                    raise
+            
+            # First try xxHash for speed if allowed or not explicitly configured
+            if config_allows_xxhash or config_allows_xxhash is None:
+                try:
+                    import xxhash
+                    return self.calculate_xxhash(file_path)
+                except ImportError:
+                    logger.warning("xxhash module not available, falling back to parallel checksum")
+            else:
+                logger.debug("xxhash disabled in config, using parallel MD5")
+                
+            # Fall back to parallel method
+            return self.calculate_parallel_checksum(file_path)
+            
+        finally:
+            # Clean up temp file if we created one
+            if temp_path and os.path.exists(temp_path):
+                try:
+                    os.unlink(temp_path)
+                except Exception as e:
+                    logger.warning(f"Failed to clean up temp file {temp_path}: {e}")
+            
+    def parallel_checksum(self, file_path, num_processes=None):
+        """Parallel implementation of checksum calculation."""
+        
+        # For local files
+        if os.path.exists(file_path):
+            return self.calculate_parallel_checksum(file_path, num_processes)
+        
+        # For SMB paths, download to temp first
+        elif hasattr(self, 'conn') and self.conn:
+            try:
+                # Determine the share name based on the path
+                if ':' in file_path:
+                    share_name, share_path = self.extract_share_path(file_path)
+                else:
+                    share_name = self.share_config['name']
+                    share_path = file_path
+                
+                # Download to temp file
+                temp_path = self.get_temp_file(share_path, os.path.basename(share_path))
+                logger.debug(f"Downloaded {file_path} to {temp_path} for parallel checksum")
+                
+                # Calculate checksum on the temp file
+                try:
+                    return self.calculate_parallel_checksum(temp_path, num_processes)
+                finally:
+                    # Clean up temp file
+                    if os.path.exists(temp_path):
+                        os.unlink(temp_path)
+            except Exception as e:
+                logger.error(f"Error in parallel checksum for SMB path: {e}")
+                raise
+        
+        else:
+            raise FileNotFoundError(f"File not found and no SMB connection available: {file_path}")
+    
+    def smart_checksum(self, file_path, retry_count=3, parallel=True):
+        """Smart checksum with optimized handling for large files."""
+        
+        start_time = time.time()
+        
+        for attempt in range(retry_count):
+            try:
+                # Get file size first to determine strategy
+                file_size = None
+                
+                # For SMB paths
+                if hasattr(self, 'conn') and self.conn:
+                    try:
+                        # Extract share name and relative path
+                        if ':' in file_path:
+                            share_name, file_path_rel = self.extract_share_path(file_path)
+                        else:
+                            share_name = self.share_config['name']
+                            file_path_rel = file_path
+                        
+                        # Get file attributes
+                        file_attr = self.conn.getAttributes(share_name, file_path_rel)
+                        file_size = file_attr.file_size
+                        
+                        # Get thresholds from config
+                        partial_checksum_threshold = 500 * 1024 * 1024  # 500MB default
+                        medium_file_threshold = 50 * 1024 * 1024  # 50MB default
+                        
+                        # Try to get config from db_manager if available
+                        if hasattr(self, 'db_manager') and hasattr(self.db_manager, 'config') and self.db_manager.config:
+                            config = self.db_manager.config
+                            partial_checksum_threshold = getattr(config, 'partial_checksum_threshold', partial_checksum_threshold)
+                            medium_file_threshold = getattr(config, 'medium_file_threshold', medium_file_threshold)
+                        
+                        # LARGE FILE STRATEGY (over 500MB)
+                        if file_size > partial_checksum_threshold:
+                            logger.info(f"Using smart partial checksum for large file: {file_path} ({format_size(file_size)})")
+                            
+                            # Variables for gathering partial content
+                            file_parts = []
+                            
+                            # Sample beginning of file (first 256KB)
+                            begin_buffer = io.BytesIO()
+                            self.conn.retrieveFileFromOffset(share_name, file_path_rel, begin_buffer, 0, 262144)
+                            begin_buffer.seek(0)
+                            file_parts.append(begin_buffer.getvalue())
+                            
+                            # Sample middle of file (256KB from middle)
+                            middle_offset = max(file_size // 2 - 131072, 262144)
+                            middle_buffer = io.BytesIO()
+                            self.conn.retrieveFileFromOffset(share_name, file_path_rel, middle_buffer, middle_offset, 262144)
+                            middle_buffer.seek(0)
+                            file_parts.append(middle_buffer.getvalue())
+                            
+                            # Sample end of file (last 256KB)
+                            end_offset = max(file_size - 262144, middle_offset + 262144)
+                            end_buffer = io.BytesIO()
+                            self.conn.retrieveFileFromOffset(share_name, file_path_rel, end_buffer, end_offset, 262144)
+                            end_buffer.seek(0)
+                            file_parts.append(end_buffer.getvalue())
+                            
+                            # Calculate MD5 of the sampled parts
+                            composite_md5 = hashlib.md5()
+                            for part in file_parts:
+                                composite_md5.update(part)
+                            
+                            # Create a composite fingerprint with metadata
+                            fingerprint = f"partial-{file_size}-{file_attr.last_write_time}-{composite_md5.hexdigest()}"
+                            logger.info(f"Generated partial checksum in {time.time() - start_time:.2f} seconds")
+                            return fingerprint
+                            
+                        # MEDIUM FILE STRATEGY (50MB to 500MB) - use parallel checksumming
+                        elif file_size > medium_file_threshold and parallel:
+                            # Download file to temp and use parallel checksum
+                            temp_path = self.get_temp_file(file_path_rel, os.path.basename(file_path_rel))
+                            try:
+                                return self.parallel_checksum(temp_path)
+                            finally:
+                                if os.path.exists(temp_path):
+                                    os.unlink(temp_path)
+                                    
+                        # SMALL FILE STRATEGY - use standard checksumming
+                        else:
+                            return self.calculate_streaming_checksum(file_path)
+                            
+                    except Exception as e:
+                        logger.error(f"Error in smart checksum: {e}")
+                        raise
+                        
+                # For local files
+                else:
+                    # Determine which strategy based on file size
+                    if os.path.exists(file_path):
+                        file_size = os.path.getsize(file_path)
+                    else:
+                        raise FileNotFoundError(f"Local file not found: {file_path}")
+                    
+                    # Get thresholds from config
+                    partial_checksum_threshold = 500 * 1024 * 1024  # 500MB default
+                    medium_file_threshold = 50 * 1024 * 1024  # 50MB default
+                    
+                    # Try to get config from db_manager if available
+                    if hasattr(self, 'db_manager') and hasattr(self.db_manager, 'config') and self.db_manager.config:
+                        config = self.db_manager.config
+                        partial_checksum_threshold = getattr(config, 'partial_checksum_threshold', partial_checksum_threshold)
+                        medium_file_threshold = getattr(config, 'medium_file_threshold', medium_file_threshold)
+                    
+                    # Large file strategy
+                    if file_size > partial_checksum_threshold:
+                        logger.info(f"Using partial checksum for large local file: {file_path}")
+                        
+                        # Sample beginning, middle and end
+                        with open(file_path, 'rb') as f:
+                            # Read beginning
+                            begin_data = f.read(262144)
+                            
+                            # Read middle
+                            f.seek(max(file_size // 2 - 131072, 262144))
+                            middle_data = f.read(262144)
+                            
+                            # Read end
+                            f.seek(max(file_size - 262144, 0))
+                            end_data = f.read(262144)
+                        
+                        # Combine into composite checksum
+                        composite_md5 = hashlib.md5()
+                        composite_md5.update(begin_data)
+                        composite_md5.update(middle_data)
+                        composite_md5.update(end_data)
+                        
+                        # Create fingerprint with metadata
+                        mtime = os.path.getmtime(file_path)
+                        fingerprint = f"partial-{file_size}-{mtime}-{composite_md5.hexdigest()}"
+                        logger.info(f"Generated partial checksum in {time.time() - start_time:.2f} seconds")
+                        return fingerprint
+                    
+                    # Medium files
+                    elif file_size > medium_file_threshold and parallel:
+                        return self.parallel_checksum(file_path)
+                    
+                    # Small files
+                    else:
+                        with open(file_path, 'rb') as f:
+                            return self.calculate_checksum(f)
+                
+            except FileNotFoundError as e:
+                if attempt == retry_count - 1:
+                    logger.error(f"File not found after {retry_count} attempts: {file_path}")
+                    raise
+                else:
+                    time.sleep(2)
+                    logger.warning(f"Retrying checksum for file {file_path}, attempt {attempt+2}/{retry_count}")
+                    
+            except Exception as e:
+                logger.error(f"Error calculating checksum for {file_path}: {str(e)}")
+                if attempt == retry_count - 1:
+                    raise
+                time.sleep(2)
+        
+        raise RuntimeError(f"Failed to calculate checksum for {file_path} after {retry_count} attempts")
     
     def calculate_streaming_checksum(self, file_path):
         """Calculate MD5 checksum by streaming the file without saving to disk."""
@@ -790,8 +1202,14 @@ class ShareScanner:
                     
                     # For changed or new files, calculate checksum
                     try:
-                        # Calculate checksum by streaming the file (no temp file needed)
-                        checksum = self.calculate_streaming_checksum(full_path)
+                        # Calculate checksum using the most efficient method based on file size with retries
+                        # Get retry count from config if available
+                        retry_count = 3  # Default value
+                        
+                        # Try to get config from db_manager if available
+                        if hasattr(self.db_manager, 'config') and self.db_manager.config:
+                            retry_count = getattr(self.db_manager.config, 'checksum_retry_count', retry_count)
+                        checksum = self.smart_checksum(full_path, retry_count=retry_count)
                         
                         # Yield the file information
                         yield {
@@ -814,33 +1232,53 @@ class S3Manager:
     
     def __init__(self, config):
         self.config = config
-        self.s3_client = boto3.client(
+        
+        # Configure boto3 session with larger connection pool
+        session = boto3.session.Session()
+        
+        # Create a client with custom connection pool config
+        self.s3_client = session.client(
             's3',
             aws_access_key_id=config.aws_access_key,
             aws_secret_access_key=config.aws_secret_key,
-            region_name=config.aws_region
+            region_name=config.aws_region,
+            config=boto3.session.Config(
+                max_pool_connections=50,  # Increase from default of 10
+                retries={'max_attempts': 3},
+                connect_timeout=60,
+                read_timeout=300  # 5 minutes for large file operations
+            )
         )
     
     def upload_file(self, local_file_path, s3_key):
-        """Upload a file to S3 storage."""
+        """Upload a file to S3 storage with automatic multipart for large files."""
         try:
-            # Use the storage_class attribute directly from config
+            # Configure thresholds
+            file_size = os.path.getsize(local_file_path)
+            multipart_threshold = self.config.multipart_threshold
+            
+            # Use the storage_class attribute from config
             storage_class = self.config.storage_class
             logger.debug(f"Using storage class for upload: {storage_class}")
             
-            extra_args = {
-                'StorageClass': storage_class
-            }
-            
-            self.s3_client.upload_file(
-                local_file_path,
-                self.config.s3_bucket,
-                s3_key,
-                ExtraArgs=extra_args
-            )
-            
-            logger.info(f"Successfully uploaded {local_file_path} to s3://{self.config.s3_bucket}/{s3_key}")
-            return True
+            if file_size > multipart_threshold:
+                logger.info(f"Using multipart upload for {local_file_path} ({format_size(file_size)})")
+                return self._upload_multipart_concurrent(local_file_path, s3_key, file_size, storage_class)
+            else:
+                # Standard upload for smaller files
+                extra_args = {
+                    'StorageClass': storage_class
+                }
+                
+                self.s3_client.upload_file(
+                    local_file_path,
+                    self.config.s3_bucket,
+                    s3_key,
+                    ExtraArgs=extra_args
+                )
+                
+                logger.info(f"Successfully uploaded {local_file_path} to s3://{self.config.s3_bucket}/{s3_key}")
+                return True
         except botocore.exceptions.ClientError as e:
             logger.error(f"Error uploading {local_file_path} to S3: {str(e)}")
             # Add error details for better debugging
@@ -851,6 +1289,123 @@ class S3Manager:
             logger.error(f"Unexpected error uploading {local_file_path}: {str(e)}")
             import traceback
             logger.error(traceback.format_exc())
+            return False
+            
+    def _upload_part(self, part_number, data, bucket, key, upload_id):
+        """Upload a single part of a multipart upload."""
+        try:
+            response = self.s3_client.upload_part(
+                Bucket=bucket,
+                Key=key,
+                UploadId=upload_id,
+                PartNumber=part_number,
+                Body=data
+            )
+            return response['ETag']
+        except Exception as e:
+            logger.error(f"Error uploading part {part_number}: {str(e)}")
+            raise
+            
+    def _upload_multipart_concurrent(self, local_file_path, s3_key, file_size, storage_class):
+        """Perform a concurrent multipart upload for large files with intelligent part sizing."""
+        # Calculate optimal part size based on file size
+        # - Amazon S3 supports up to 10,000 parts
+        # - Each part must be between 5MB and 5GB
+        # - For optimal performance, aim for larger parts for very large files
+        
+        min_part_size = 5 * 1024 * 1024  # 5MB minimum
+        part_size = max(min_part_size, file_size // 10000)  # Ensure we don't exceed part count
+        
+        # For very large files, use larger part sizes for better performance
+        if file_size > 1024 * 1024 * 1024 * 10:  # 10GB
+            part_size = max(part_size, 100 * 1024 * 1024)  # Use at least 100MB parts
+        elif file_size > 1024 * 1024 * 1024:  # 1GB
+            part_size = max(part_size, 50 * 1024 * 1024)  # Use at least 50MB parts
+        
+        # Round up to nearest MB for cleaner sizes
+        part_size = ((part_size + (1024 * 1024) - 1) // (1024 * 1024)) * (1024 * 1024)
+        
+        logger.debug(f"Using part size of {format_size(part_size)} for {format_size(file_size)} file")
+        
+        upload_id = None
+        
+        try:
+            # 1. Initiate multipart upload
+            response = self.s3_client.create_multipart_upload(
+                Bucket=self.config.s3_bucket,
+                Key=s3_key,
+                StorageClass=storage_class
+            )
+            upload_id = response['UploadId']
+            
+            logger.debug(f"Initiated multipart upload ID: {upload_id}")
+            
+            # 2. Upload parts concurrently
+            parts = []
+            total_parts = (file_size + part_size - 1) // part_size
+            
+            with ThreadPoolExecutor(max_workers=self.config.multipart_max_concurrent) as executor:
+                futures = []
+                
+                with open(local_file_path, 'rb') as f:
+                    part_number = 1
+                    
+                    while True:
+                        data = f.read(part_size)
+                        if not data:
+                            break
+                        
+                        # Submit upload task
+                        future = executor.submit(
+                            self._upload_part,
+                            part_number,
+                            data,
+                            self.config.s3_bucket,
+                            s3_key,
+                            upload_id
+                        )
+                        futures.append((part_number, future))
+                        part_number += 1
+                
+                # Process results
+                for part_number, future in sorted(futures):
+                    try:
+                        etag = future.result()
+                        parts.append({
+                            'PartNumber': part_number,
+                            'ETag': etag
+                        })
+                        logger.debug(f"Completed part {part_number}/{total_parts} for {s3_key}")
+                    except Exception as e:
+                        logger.error(f"Failed to upload part {part_number}: {str(e)}")
+                        raise
+            
+            # 3. Complete multipart upload
+            self.s3_client.complete_multipart_upload(
+                Bucket=self.config.s3_bucket,
+                Key=s3_key,
+                UploadId=upload_id,
+                MultipartUpload={'Parts': parts}
+            )
+            
+            logger.info(f"Successfully completed multipart upload for {local_file_path} to s3://{self.config.s3_bucket}/{s3_key}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error in multipart upload for {local_file_path}: {str(e)}")
+            
+            # Attempt to abort the multipart upload
+            if upload_id:
+                try:
+                    self.s3_client.abort_multipart_upload(
+                        Bucket=self.config.s3_bucket,
+                        Key=s3_key,
+                        UploadId=upload_id
+                    )
+                    logger.info(f"Aborted failed multipart upload ID: {upload_id}")
+                except Exception as abort_error:
+                    logger.error(f"Failed to abort multipart upload: {str(abort_error)}")
+                
             return False
     
     def copy_object(self, source_key, dest_key):
@@ -943,7 +1498,7 @@ class BackupManager:
     
     def __init__(self, config):
         self.config = config
-        self.db_manager = DatabaseManager(config.db_path)
+        self.db_manager = DatabaseManager(config.db_path, config)  # Pass config to DatabaseManager
         self.s3_manager = S3Manager(config)
         self.scan_errors = []  # Track directory scan errors
         
@@ -1543,8 +2098,146 @@ Next Steps:
         
         logger.info("Index synchronization completed")
     
-    def upload_file_to_s3(self, file_info, s3_key):
-        """Upload a file to S3 and update the index."""
+    def direct_stream_to_s3(self, scanner, share_path, s3_key, file_size):
+        """Stream a file directly from SMB to S3 without local storage."""
+        # Initialize multipart upload
+        response = self.s3_manager.s3_client.create_multipart_upload(
+            Bucket=self.config.s3_bucket,
+            Key=s3_key,
+            StorageClass=self.config.storage_class
+        )
+        upload_id = response['UploadId']
+        
+        try:
+            # Calculate optimal part size (min 5MB, aim for reasonable number of parts)
+            part_size = max(5 * 1024 * 1024, min(100 * 1024 * 1024, file_size // 10))
+            
+            # Stream in chunks directly to S3
+            parts = []
+            part_number = 1
+            offset = 0
+            
+            while offset < file_size:
+                current_part_size = min(part_size, file_size - offset)
+                
+                # Create a memory buffer for this chunk
+                buffer = io.BytesIO()
+                
+                # Read this chunk from SMB
+                scanner.conn.retrieveFileFromOffset(
+                    scanner.share_config['name'], 
+                    share_path, 
+                    buffer, 
+                    offset, 
+                    current_part_size
+                )
+                buffer.seek(0)
+                
+                # Upload this part to S3
+                response = self.s3_manager.s3_client.upload_part(
+                    Bucket=self.config.s3_bucket,
+                    Key=s3_key,
+                    UploadId=upload_id,
+                    PartNumber=part_number,
+                    Body=buffer.getvalue()
+                )
+                
+                # Save the ETag
+                parts.append({
+                    'PartNumber': part_number,
+                    'ETag': response['ETag']
+                })
+                
+                # Move to next part
+                part_number += 1
+                offset += current_part_size
+                logger.info(f"Uploaded part {part_number-1} of {share_path} ({format_size(current_part_size)})")
+            
+            # Complete the multipart upload
+            self.s3_manager.s3_client.complete_multipart_upload(
+                Bucket=self.config.s3_bucket,
+                Key=s3_key,
+                UploadId=upload_id,
+                MultipartUpload={'Parts': parts}
+            )
+            
+            return True
+        except Exception as e:
+            logger.error(f"Error in direct streaming upload: {str(e)}")
+            # Abort the multipart upload
+            try:
+                self.s3_manager.s3_client.abort_multipart_upload(
+                    Bucket=self.config.s3_bucket,
+                    Key=s3_key,
+                    UploadId=upload_id
+                )
+            except Exception as abort_error:
+                logger.error(f"Failed to abort multipart upload: {str(abort_error)}")
+            return False
+    
+    def smart_process_large_file(self, file_info, s3_key):
+        """Optimized method for large files that skips redundant transfers."""
+        share_path = file_info['share_path']
+        share_config = file_info['share_config']
+        
+        # 1. Check if file exists in database with same size and modification time
+        existing_file = self.db_manager.get_file_by_path(file_info['local_path'])
+        if existing_file and existing_file[3] == file_info['size'] and \
+           existing_file[4] == file_info['last_modified'].isoformat():
+            # File hasn't changed - if it's already in S3, we're done
+            # Check if the uploaded_to_s3 field exists and is set to 1
+            uploaded_to_s3 = 0
+            if existing_file and len(existing_file) >= 12:  # Make sure the field exists
+                uploaded_to_s3 = existing_file[11]
+                
+            if uploaded_to_s3 == 1:
+                logger.info(f"Large file unchanged and already in S3, skipping: {file_info['local_path']}")
+                return True
+        
+        # 2. For large files (>500MB by default), use a partial checksum approach
+        direct_upload_threshold = getattr(self.config, 'direct_upload_threshold', 500 * 1024 * 1024)
+        if file_info['size'] > direct_upload_threshold:
+            logger.info(f"Using partial checksum for large file: {share_path} ({format_size(file_info['size'])})")
+            
+            # Connect to share if needed
+            scanner = ShareScanner(share_config, self.db_manager)
+            if not scanner.connect():
+                logger.error(f"Failed to connect to share {share_config['name']}")
+                return False
+            
+            try:
+                # Just stream directly to S3 without local temp storage
+                # This is the key optimization - we're skipping the download-then-upload pattern
+                success = self.direct_stream_to_s3(scanner, share_path, s3_key, file_info['size'])
+                
+                if success:
+                    # Generate a simple checksum just for tracking (not for deduplication)
+                    # We're using size + mtime as the effective "checksum" for very large files
+                    simple_checksum = f"size_{file_info['size']}_mtime_{file_info['last_modified'].timestamp()}"
+                    
+                    # Update database with this file as uploaded
+                    self.db_manager.add_file(
+                        local_path=file_info['local_path'],
+                        s3_path=s3_key,
+                        size=file_info['size'],
+                        last_modified=file_info['last_modified'].isoformat(),
+                        checksum=simple_checksum,
+                        previous_path=None,
+                        moved_in_s3=0,
+                        file_name=file_info.get('file_name', os.path.basename(share_path)),
+                        uploaded_to_s3=1
+                    )
+                    return True
+                
+                return False
+            finally:
+                scanner.disconnect()
+        
+        # For smaller files, use the regular method
+        return self.regular_upload_process(file_info, s3_key)
+    
+    def regular_upload_process(self, file_info, s3_key):
+        """Regular upload process for normal sized files."""
         # Initialize variables
         temp_path = None
         scanner = None
@@ -1595,6 +2288,11 @@ Next Steps:
         except Exception as e:
             logger.error(f"Error uploading {file_info['local_path']}: {str(e)}")
             return False
+    
+    def upload_file_to_s3(self, file_info, s3_key):
+        """Upload a file to S3 and update the index."""
+        # Use the smart method which will handle both large and small files optimally
+        return self.smart_process_large_file(file_info, s3_key)
     def verify_and_upload_missing(self):
         """
         Verify files in the index exist in S3 and upload any missing files.
