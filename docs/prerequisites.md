@@ -31,7 +31,9 @@ python3 -m venv s3backup_env
 source s3backup_env/bin/activate
 
 # Install dependencies
-pip install boto3 pysmb pandas schedule configparser cryptography
+pip install boto3 pysmb pandas schedule configparser cryptography xxhash
+# If you plan to use O365 for notifications:
+pip install azure-identity msgraph-core
 
 deactivate
 ```
