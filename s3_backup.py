@@ -34,16 +34,49 @@ from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
-# Configure logging
+# Initial basic logging configuration (will be replaced by setup_logging)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('s3_backup.log'),
         logging.StreamHandler()
     ]
 )
 logger = logging.getLogger('s3_backup')
+
+def setup_logging(config):
+    """Set up logging with a new log file for each run based on date."""
+    # Ensure log directory exists
+    os.makedirs(config.log_path, exist_ok=True)
+    
+    # Create log filename with timestamp
+    timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    log_file = os.path.join(config.log_path, f's3_backup_{timestamp}.log')
+    
+    # Create formatter
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    
+    # Configure root logger
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    
+    # Remove any existing handlers to avoid duplicates
+    for hdlr in root_logger.handlers[:]:
+        root_logger.removeHandler(hdlr)
+    
+    # Add file handler for the new log file
+    file_handler = logging.FileHandler(log_file)
+    file_handler.setFormatter(formatter)
+    root_logger.addHandler(file_handler)
+    
+    # Add console handler
+    console = logging.StreamHandler()
+    console.setFormatter(formatter)
+    root_logger.addHandler(console)
+    
+    logger = logging.getLogger('s3_backup')
+    logger.info(f"Logging to: {log_file}")
+    return logger
 
 # Global configuration
 CONFIG_FILE = 'config.ini'
@@ -96,6 +129,62 @@ def decrypt_config(encrypted_data, password, salt):
         logger.error(f"Decryption failed: {str(e)}")
         return None, False
 
+def cleanup_old_logs(config):
+    """Remove log files older than the configured retention period."""
+    log_path = config.log_path
+    retention_days = config.log_retention_days
+    
+    # Calculate cutoff date
+    cutoff_time = time.time() - (retention_days * 24 * 3600)
+    
+    # Ensure log directory exists
+    if not os.path.exists(log_path):
+        logger.debug(f"Log directory {log_path} does not exist, nothing to clean up")
+        return
+    
+    # Find and remove old log files
+    count = 0
+    for filename in os.listdir(log_path):
+        if filename.startswith('s3_backup_') and filename.endswith('.log'):
+            filepath = os.path.join(log_path, filename)
+            if os.path.isfile(filepath) and os.path.getmtime(filepath) < cutoff_time:
+                try:
+                    os.remove(filepath)
+                    count += 1
+                except Exception as e:
+                    logger.error(f"Failed to remove old log {filepath}: {e}")
+    
+    if count > 0:
+        logger.info(f"Removed {count} log files older than {retention_days} days")
+
+def cleanup_old_reports(config):
+    """Remove report files older than the configured retention period."""
+    report_path = config.report_path
+    retention_days = config.report_retention_days
+    
+    # Calculate cutoff date
+    cutoff_time = time.time() - (retention_days * 24 * 3600)
+    
+    # Ensure report directory exists
+    if not os.path.exists(report_path):
+        logger.debug(f"Report directory {report_path} does not exist, nothing to clean up")
+        return
+    
+    # Find and remove old report files
+    count = 0
+    for filename in os.listdir(report_path):
+        if filename.startswith('backup_report_') and filename.endswith('.csv'):
+            filepath = os.path.join(report_path, filename)
+            if os.path.isfile(filepath) and os.path.getmtime(filepath) < cutoff_time:
+                try:
+                    os.remove(filepath)
+                    count += 1
+                except Exception as e:
+                    logger.error(f"Failed to remove old report {filepath}: {e}")
+    
+    if count > 0:
+        logger.info(f"Removed {count} report files older than {retention_days} days")
+
 def is_encrypted(file_path):
     """Check if a file appears to be encrypted."""
     try:
@@ -143,6 +232,9 @@ class Config:
         self.storage_class = 'STANDARD_IA'  # Default storage class
         self.db_path = 'backup_index.db'
         self.report_path = 'reports/'
+        self.log_path = 'logs/'  # Directory for storing logs
+        self.log_retention_days = 30  # Number of days to keep logs
+        self.report_retention_days = 30  # Number of days to keep reports
         self.shares = []
         self.scan_interval = 24  # hours
         self.thread_count = 4
@@ -153,7 +245,9 @@ class Config:
         self.email_smtp_port = 25
         self.email_from = ''
         self.email_to = ''
-        self.email_subject_prefix = '[S3 Backup]'
+        self.email_subject_prefix = 'S3 Tool'  # Changed as requested
+        self.email_attach_report = False  # Whether to attach backup reports to emails
+        self.email_max_attachment_size = 10 * 1024 * 1024  # 10MB default
         
         self.load_config()
     
@@ -213,6 +307,9 @@ class Config:
             if 'General' in self.config:
                 self.db_path = self.config['General'].get('db_path', 'backup_index.db')
                 self.report_path = self.config['General'].get('report_path', 'reports/')
+                self.log_path = self.config['General'].get('log_path', 'logs/')
+                self.log_retention_days = int(self.config['General'].get('log_retention_days', '30'))
+                self.report_retention_days = int(self.config['General'].get('report_retention_days', '30'))
                 self.scan_interval = int(self.config['General'].get('scan_interval', '24'))
                 self.thread_count = int(self.config['General'].get('thread_count', '4'))
                 self.multipart_threshold = int(self.config['General'].get('multipart_threshold', str(8 * 1024 * 1024)))
@@ -233,7 +330,9 @@ class Config:
                 self.email_smtp_port = int(self.config['Email'].get('smtp_port', '25'))
                 self.email_from = self.config['Email'].get('from', '')
                 self.email_to = self.config['Email'].get('to', '')
-                self.email_subject_prefix = self.config['Email'].get('subject_prefix', '[S3 Backup]')
+                self.email_subject_prefix = self.config['Email'].get('subject_prefix', 'S3 Tool')
+                self.email_attach_report = self.config['Email'].getboolean('attach_report', False)
+                self.email_max_attachment_size = int(self.config['Email'].get('max_attachment_size', '10485760'))
             
             # Shares
             if 'Shares' in self.config:
@@ -269,6 +368,9 @@ class Config:
         self.config['General'] = {
             'db_path': 'backup_index.db',
             'report_path': 'reports/',
+            'log_path': 'logs/',
+            'log_retention_days': '30',
+            'report_retention_days': '30',
             'scan_interval': '24',
             'thread_count': '4',
             'multipart_threshold': '8388608',  # 8MB in bytes
@@ -287,7 +389,9 @@ class Config:
             'smtp_port': '25',
             'from': 'backup@example.com',
             'to': 'admin@example.com',
-            'subject_prefix': '[S3 Backup]'
+            'subject_prefix': 'S3 Tool',
+            'attach_report': 'false',
+            'max_attachment_size': '10485760'  # 10MB default
         }
         
         self.config['Shares'] = {
@@ -2492,6 +2596,10 @@ Status: {status}
         """Run a full backup process and update index database."""
         logger.info("Starting backup process")
         
+        # Clean up old logs and reports first
+        cleanup_old_logs(self.config)
+        cleanup_old_reports(self.config)
+        
         # Start tracking the backup run
         run_id = self.db_manager.start_backup_run()
         
@@ -2575,8 +2683,8 @@ Status: {status}
             run_id, status, files_processed, files_uploaded, bytes_uploaded, files_failed
         )
         
-        # Generate report
-        self.generate_report(success_records, failure_records)
+        # Generate report and save path for email attachment
+        report_file = self.generate_report(success_records, failure_records)
         
         # Add run details, including moved files, renamed files and scan errors
         now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -2609,11 +2717,12 @@ Status: {status}
         if self.config.email_enabled:
             self.send_email(
                 subject=f"Backup Summary - {status}",
-                body=details
+                body=details,
+                report_file=report_file
             )
     
-    def send_email(self, subject, body):
-        """Send an email notification with the backup summary."""
+    def send_email(self, subject, body, report_file=None):
+        """Send an email notification with optional report attachment."""
         if not self.config.email_enabled:
             return
         
@@ -2625,10 +2734,33 @@ Status: {status}
         try:
             # Create the email message
             msg = EmailMessage()
-            msg['Subject'] = f"{self.config.email_subject_prefix} {subject}"
+            # Use subject_prefix only if it's not empty
+            prefix = f"{self.config.email_subject_prefix} " if self.config.email_subject_prefix else ""
+            msg['Subject'] = f"{prefix}{subject}"
             msg['From'] = self.config.email_from
             msg['To'] = self.config.email_to
             msg.set_content(body)
+            
+            # Attach report if enabled and file exists
+            if self.config.email_attach_report and report_file and os.path.exists(report_file):
+                # Check file size
+                file_size = os.path.getsize(report_file)
+                if file_size <= self.config.email_max_attachment_size:
+                    # Get MIME type based on file extension
+                    mime_type = 'text/csv' if report_file.endswith('.csv') else 'text/plain'
+                    
+                    # Read the file and attach it
+                    with open(report_file, 'rb') as f:
+                        file_data = f.read()
+                        msg.add_attachment(file_data, 
+                                           maintype='text',
+                                           subtype=mime_type.split('/')[1],
+                                           filename=os.path.basename(report_file))
+                    logger.info(f"Attached report {report_file} to email notification")
+                else:
+                    logger.warning(f"Report file {report_file} exceeds max attachment size ({format_size(file_size)} > {format_size(self.config.email_max_attachment_size)})")
+                    # Add note to email body
+                    msg.set_content(body + f"\n\nNote: Backup report was not attached because it exceeds size limit ({format_size(file_size)}).")
             
             # Send the email
             logger.info(f"Sending email notification to {self.config.email_to}")
@@ -2643,6 +2775,7 @@ Status: {status}
     def generate_report(self, success_records, failure_records):
         """Generate CSV report of backup results."""
         timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+        report_date = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         report_file = os.path.join(self.config.report_path, f'backup_report_{timestamp}.csv')
         
         # Combine records and add status
@@ -2650,11 +2783,25 @@ Status: {status}
         for record in success_records:
             record['status'] = 'SUCCESS'
             record['error_type'] = ''
+            record['error'] = ''
+            record['backup_date'] = report_date
+            # Convert size to GB
+            record['size_gb'] = f"{record['size'] / (1024**3):.3f}"
+            # Remove the size in bytes as requested
+            if 'size' in record:
+                del record['size']
             all_records.append(record)
         
         for record in failure_records:
             record['status'] = 'FAILURE'
             record['error_type'] = 'UPLOAD_ERROR'
+            record['backup_date'] = report_date
+            # Convert size to GB if size exists
+            if 'size' in record and record['size']:
+                record['size_gb'] = f"{record['size'] / (1024**3):.3f}"
+                del record['size']
+            else:
+                record['size_gb'] = "0.000"
             all_records.append(record)
             
         # Add scan errors
@@ -2665,17 +2812,30 @@ Status: {status}
                 'name': os.path.basename(error['path']),
                 'local_path': f"{share_name}:{error['path']}",
                 's3_path': '',
-                'size': 0,
+                'size_gb': '0.000',
                 'status': 'FAILURE',
                 'error': error['message'],
-                'error_type': 'SCAN_ERROR'
+                'error_type': 'SCAN_ERROR',
+                'backup_date': report_date
             }
             all_records.append(error_record)
         
         # Write to CSV
         try:
             # Define all possible fields
-            fieldnames = ['name', 'local_path', 's3_path', 'size', 'status', 'error', 'error_type']
+            fieldnames = [
+                'backup_date',
+                'name',             # Filename
+                'local_path',       # Full local path
+                's3_path',          # Path in S3
+                'size_gb',          # Size in GB
+                'status',           # SUCCESS/FAILURE
+                'error_type',       # Error category if applicable
+                'error'             # Error details if applicable
+            ]
+            
+            # Create report directory if it doesn't exist
+            os.makedirs(os.path.dirname(report_file), exist_ok=True)
             
             with open(report_file, 'w', newline='') as csvfile:
                 writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
@@ -2690,8 +2850,10 @@ Status: {status}
                     writer.writerow(record)
             
             logger.info(f"Report generated: {report_file}")
+            return report_file
         except Exception as e:
             logger.error(f"Error generating report: {str(e)}")
+            return None
 
 
 def run_scheduled_backup(config):
@@ -3130,6 +3292,9 @@ def main():
     
     # Create config object with password if needed
     config = Config(args.config, password=password)
+    
+    # Set up logging
+    logger = setup_logging(config)
     
     # Handle encryption of existing config
     if args.encrypt_config and config_exists and not encrypted:
