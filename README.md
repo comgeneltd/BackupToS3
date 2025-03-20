@@ -11,6 +11,8 @@ A tool for backing up Windows shares to S3 storage with local indexing.
 - Scheduling capabilities for automated backups
 - Verification of backups to ensure data integrity
 - Detailed reports and logging
+- Intelligent multipart uploads for large files
+- Configurable concurrency settings for improved performance
 
 ## Documentation
 
@@ -20,6 +22,7 @@ A tool for backing up Windows shares to S3 storage with local indexing.
 - [Email notifications](docs/Email-config-documentation.md)
 - [Troubleshooting](docs/troubleshooting-guide.md)
 - [Storage Class](docs/Storage-Class.md)
+- [Multipart upload](docs/multipart-upload.md)
 
 
 
