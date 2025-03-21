@@ -2,6 +2,18 @@
 
 This document provides solutions for common issues encountered when using the BackupToS3 tool.
 
+## Common Errors
+
+### "Invalid file path format" Error
+
+If you see an error like `Invalid file path format: Windows.iso` or similar:
+
+This typically happens when accessing files at the root level of a share. The tool now includes improved share path handling to automatically resolve this issue (version 1.3+).
+
+The tool will automatically use the current share's name when a file path is provided without a share prefix, making it easier to work with root-level files.
+
+For older versions, make sure to use the format `sharename:/path/to/file` when specifying files, even for files at the root level of a share (e.g., `myshare:/Windows.iso`).
+
 ## Force Re-upload
 
 If you need to force the tool to re-upload all files (for example, after storage class changes):

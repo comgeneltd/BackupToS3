@@ -54,6 +54,39 @@
 ./s3backup.sh --generate-delete-script --script-path delete_script.sh
 ```
 
+## Performance Optimization Settings
+
+BackupToS3 includes several configuration options to optimize performance for different scenarios:
+
+```ini
+[General]
+# Size threshold for using multipart upload (default: 8MB)
+multipart_threshold = 8388608
+
+# Maximum concurrent uploads for multipart transfers (default: 4)
+multipart_max_concurrent = 4
+
+# Files larger than this use direct streaming from SMB to S3 (default: 500MB)
+direct_upload_threshold = 524288000
+
+# Files larger than this use xxHash or parallel processing (default: 100MB)
+checksum_parallel_threshold = 104857600
+
+# Number of parallel processes for checksum calculation (default: auto)
+checksum_parallel_processes = 
+
+# Whether to use xxHash for faster checksums (default: false)
+use_xxhash = false
+
+# Number of retries for checksum calculation (default: 3)
+checksum_retry_count = 3
+```
+
+For very large files (like ISO images), the tool uses:
+1. Direct streaming from SMB to S3 without local temp storage
+2. Size+time based tracking instead of full checksumming
+3. Smart transfer resumption to avoid re-uploading unchanged files
+
 ## Encrypted Configuration
 
 ```bash

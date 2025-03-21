@@ -82,6 +82,35 @@ def setup_logging(config):
 CONFIG_FILE = 'config.ini'
 CONFIG_SALT_FILE = '.config.salt'  # File to store the salt
 
+def check_dependencies():
+    """Check if optional dependencies are installed."""
+    graph_api_available = True
+    
+    # Check for Microsoft Graph API dependencies with detailed logging
+    logger.debug("Checking Microsoft Graph API dependencies...")
+    
+    try:
+        # Check for azure-identity
+        import azure.identity
+        logger.debug(f"✓ azure.identity found (version: {getattr(azure.identity, '__version__', 'unknown')})")
+        
+        # Check for the specific class we need
+        from azure.identity import ClientSecretCredential
+        
+        # Check for requests library (standard in Python)
+        import requests
+        
+        logger.info("Microsoft Graph API dependencies verified successfully")
+        
+    except ImportError as e:
+        graph_api_available = False
+        logger.warning("Microsoft Graph API dependencies not installed. Graph API email functionality will not be available.")
+        logger.info("To use Microsoft Graph API for Office 365 email integration, install:")
+        logger.info("pip install azure-identity")
+        logger.debug(f"Import error details: {str(e)}")
+    
+    return graph_api_available
+
 def derive_key(password, salt=None):
     """Derive an encryption key from a password."""
     if salt is None:
@@ -248,6 +277,18 @@ class Config:
         self.email_subject_prefix = 'S3 Tool'  # Changed as requested
         self.email_attach_report = False  # Whether to attach backup reports to emails
         self.email_max_attachment_size = 10 * 1024 * 1024  # 10MB default
+        self.email_auth_required = False
+        self.email_username = ''
+        self.email_password = ''
+        self.email_use_tls = False
+        
+        # Microsoft Graph API settings
+        self.graph_enabled = False
+        self.graph_client_id = ''
+        self.graph_tenant_id = ''
+        self.graph_client_secret = ''
+        self.graph_user_id = ''
+        self.graph_save_to_sent_items = True
         
         self.load_config()
     
@@ -333,6 +374,19 @@ class Config:
                 self.email_subject_prefix = self.config['Email'].get('subject_prefix', 'S3 Tool')
                 self.email_attach_report = self.config['Email'].getboolean('attach_report', False)
                 self.email_max_attachment_size = int(self.config['Email'].get('max_attachment_size', '10485760'))
+                self.email_auth_required = self.config['Email'].getboolean('auth_required', False)
+                self.email_username = self.config['Email'].get('username', '')
+                self.email_password = self.config['Email'].get('password', '')
+                self.email_use_tls = self.config['Email'].getboolean('use_tls', False)
+            
+            # Microsoft Graph API settings
+            if 'GraphAPI' in self.config:
+                self.graph_enabled = self.config['GraphAPI'].getboolean('enabled', False)
+                self.graph_client_id = self.config['GraphAPI'].get('client_id', '')
+                self.graph_tenant_id = self.config['GraphAPI'].get('tenant_id', '')
+                self.graph_client_secret = self.config['GraphAPI'].get('client_secret', '')
+                self.graph_user_id = self.config['GraphAPI'].get('user_id', '')
+                self.graph_save_to_sent_items = self.config['GraphAPI'].getboolean('save_to_sent_items', True)
             
             # Shares
             if 'Shares' in self.config:
@@ -391,7 +445,20 @@ class Config:
             'to': 'admin@example.com',
             'subject_prefix': 'S3 Tool',
             'attach_report': 'false',
-            'max_attachment_size': '10485760'  # 10MB default
+            'max_attachment_size': '10485760',  # 10MB default
+            'auth_required': 'false',
+            'username': '',
+            'password': '',
+            'use_tls': 'false'
+        }
+        
+        self.config['GraphAPI'] = {
+            'enabled': 'false',
+            'client_id': '',
+            'tenant_id': '',
+            'client_secret': '',
+            'user_id': '',
+            'save_to_sent_items': 'true'
         }
         
         self.config['Shares'] = {
@@ -2721,6 +2788,107 @@ Status: {status}
                 report_file=report_file
             )
     
+    def send_email_via_graph(self, subject, body, report_file=None):
+        """Send an email notification using Microsoft Graph API."""
+        try:
+            # Import required libraries - minimal dependencies
+            from azure.identity import ClientSecretCredential
+            import requests
+            import base64
+            import mimetypes
+            
+            logger.info("Preparing to send email via Microsoft Graph API")
+            
+            # Authenticate with Microsoft Graph API
+            credential = ClientSecretCredential(
+                tenant_id=self.config.graph_tenant_id,
+                client_id=self.config.graph_client_id,
+                client_secret=self.config.graph_client_secret
+            )
+            
+            # Get an access token
+            token = credential.get_token("https://graph.microsoft.com/.default")
+            access_token = token.token
+            
+            # Prepare email attachment if needed
+            attachments = []
+            if self.config.email_attach_report and report_file and os.path.exists(report_file):
+                file_size = os.path.getsize(report_file)
+                if file_size <= self.config.email_max_attachment_size:
+                    # Get MIME type based on file extension
+                    content_type = mimetypes.guess_type(report_file)[0] or 'text/plain'
+                    
+                    # Read the file and encode as base64
+                    with open(report_file, 'rb') as f:
+                        file_data = f.read()
+                        file_base64 = base64.b64encode(file_data).decode('utf-8')
+                    
+                    attachments.append({
+                        '@odata.type': '#microsoft.graph.fileAttachment',
+                        'name': os.path.basename(report_file),
+                        'contentType': content_type,
+                        'contentBytes': file_base64
+                    })
+                    logger.info(f"Added attachment: {report_file}")
+                else:
+                    logger.warning(f"Report file {report_file} exceeds max attachment size ({format_size(file_size)})")
+                    body += f"\n\nNote: Backup report was not attached because it exceeds size limit ({format_size(file_size)})."
+            
+            # Set up recipients (supports multiple recipients separated by commas)
+            recipients = []
+            for email in self.config.email_to.split(','):
+                email = email.strip()
+                if email:
+                    recipients.append({
+                        'emailAddress': {
+                            'address': email
+                        }
+                    })
+            
+            # Build the email message
+            email_message = {
+                'message': {
+                    'subject': f"{self.config.email_subject_prefix} {subject}" if self.config.email_subject_prefix else subject,
+                    'body': {
+                        'contentType': 'text',
+                        'content': body
+                    },
+                    'toRecipients': recipients
+                },
+                'saveToSentItems': self.config.graph_save_to_sent_items
+            }
+            
+            # Add attachments if any
+            if attachments:
+                email_message['message']['attachments'] = attachments
+            
+            # Send the email using the Microsoft Graph API
+            headers = {
+                'Authorization': f'Bearer {access_token}',
+                'Content-Type': 'application/json'
+            }
+            
+            response = requests.post(
+                f'https://graph.microsoft.com/v1.0/users/{self.config.graph_user_id}/sendMail',
+                headers=headers,
+                json=email_message
+            )
+            
+            if response.status_code == 202:  # 202 Accepted is the success code for sendMail
+                logger.info("Email sent successfully via Microsoft Graph API")
+                return True
+            else:
+                logger.error(f"Failed to send email via Graph API: {response.status_code} - {response.text}")
+                return False
+        
+        except ImportError as e:
+            logger.error(f"Microsoft Graph API dependencies not installed: {e}")
+            logger.error("Install dependencies with: pip install azure-identity")
+            return False
+        except Exception as e:
+            logger.error(f"Error sending email via Microsoft Graph API: {e}")
+            return False
+            
     def send_email(self, subject, body, report_file=None):
         """Send an email notification with optional report attachment."""
         if not self.config.email_enabled:
@@ -2730,6 +2898,11 @@ Status: {status}
         if not self.config.email_from or not self.config.email_to:
             logger.warning("Email notification enabled but missing from/to address. Skipping notification.")
             return
+        
+        # Use Microsoft Graph API if enabled
+        if self.config.graph_enabled:
+            logger.info("Using Microsoft Graph API for email delivery")
+            return self.send_email_via_graph(subject, body, report_file)
             
         try:
             # Create the email message
@@ -2765,12 +2938,26 @@ Status: {status}
             # Send the email
             logger.info(f"Sending email notification to {self.config.email_to}")
             with smtplib.SMTP(self.config.email_smtp_server, self.config.email_smtp_port) as server:
+                # Setup TLS encryption if required
+                if self.config.email_use_tls:
+                    server.starttls()
+                
+                # Login if authentication is required
+                if self.config.email_auth_required:
+                    if not self.config.email_username or not self.config.email_password:
+                        logger.warning("SMTP authentication is required but credentials are missing.")
+                    else:
+                        server.login(self.config.email_username, self.config.email_password)
+                
+                # Send the message
                 server.send_message(msg)
+                
             logger.info("Email notification sent successfully")
+            return True
         except Exception as e:
             # Don't fail the backup job if email fails
             logger.error(f"Failed to send email notification: {str(e)}")
-            # Log the error but don't raise exception to continue the backup process
+            return False
     
     def generate_report(self, success_records, failure_records):
         """Generate CSV report of backup results."""
@@ -3230,6 +3417,8 @@ def main():
                         help='Synchronize index with AWS S3 and Windows shares (no uploads)')
     parser.add_argument('--s3-only', action='store_true', 
                         help='Show only files that exist in S3 but not in Windows shares')
+    parser.add_argument('--check-graph-api', action='store_true', 
+                        help='Test Microsoft Graph API dependencies and configuration')
     
     args = parser.parse_args()
     
@@ -3296,6 +3485,9 @@ def main():
     # Set up logging
     logger = setup_logging(config)
     
+    # Check for optional dependencies
+    check_dependencies()
+    
     # Handle encryption of existing config
     if args.encrypt_config and config_exists and not encrypted:
         # Read the existing config
@@ -3326,6 +3518,53 @@ def main():
     # Test connection if requested
     if args.test_connection:
         test_share_connections(config)
+        return
+        
+    # Check Graph API dependencies if requested
+    if args.check_graph_api:
+        # Detailed diagnostic check
+        print("Checking Microsoft Graph API dependencies:")
+        
+        try:
+            import azure.identity
+            print(f"✓ azure.identity package installed (version: {getattr(azure.identity, '__version__', 'unknown')})")
+            
+            from azure.identity import ClientSecretCredential
+            print("✓ ClientSecretCredential class available")
+            
+            import requests
+            print(f"✓ requests package available (version: {getattr(requests, '__version__', 'unknown')})")
+            
+            print("\nDependencies verified successfully!")
+            
+            # Check configuration if enabled
+            if config.graph_enabled:
+                print("\nConfiguration check:")
+                if config.graph_client_id:
+                    print("✓ Client ID configured")
+                else:
+                    print("✗ Client ID missing")
+                    
+                if config.graph_tenant_id:
+                    print("✓ Tenant ID configured")
+                else:
+                    print("✗ Tenant ID missing")
+                    
+                if config.graph_client_secret:
+                    print("✓ Client Secret configured")
+                else:
+                    print("✗ Client Secret missing")
+                    
+                if config.graph_user_id:
+                    print("✓ User ID configured")
+                else:
+                    print("✗ User ID missing")
+            
+        except ImportError as e:
+            print(f"✗ Failed to import dependencies: {e}")
+            print("\nTo install required packages, run:")
+            print("pip install azure-identity")
+        
         return
     
     # Handle the new sync-index-with-aws argument
