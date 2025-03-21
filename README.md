@@ -35,6 +35,7 @@ Compared to AWS DataSync:
 - [Troubleshooting](docs/troubleshooting-guide.md)
 - [Storage Class](docs/Storage-Class.md)
 - [Multipart upload](docs/multipart-upload.md)
+- [Checksum Configuration Parameters](docs/checksum-config.md)
 
 
 
