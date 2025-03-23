@@ -1,10 +1,12 @@
 # S3 Windows Share Sync Tool
 
 A tool for automatic uploading files from Windows shares to S3 storage with local indexing.
+
 Compared to AWS DataSync:
-    1. Zero transfer fees.
-    2. No S3 List/Get API calls on each job execution
-    3. Simple and fast install anywhere
+1. Zero transfer fees.
+2. No S3 List/Get API calls on each job execution
+3. Simple and fast install anywhere
+    
 
 ## Features
 
