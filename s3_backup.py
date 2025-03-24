@@ -798,7 +798,18 @@ class DatabaseManager:
             logger.error(f"Error finishing backup run: {str(e)}")
             return False
 
-
+def _chunk_checksum(args):
+    """Calculate checksum for a chunk of a file.
+    Args:
+        args: Tuple of (file_path, start, size)
+    """
+    file_path, start, size = args
+    md5 = hashlib.md5()
+    with open(file_path, 'rb') as f:
+        f.seek(start)
+        chunk = f.read(size)
+    md5.update(chunk)
+    return md5.digest()
 class ShareScanner:
     """Scanner for Windows SMB shares."""
     
@@ -909,36 +920,27 @@ class ShareScanner:
     def calculate_parallel_checksum(self, file_path, num_processes=None):
         """Calculate MD5 checksum using parallel processing for large files."""
         import multiprocessing
-        
+    
         if num_processes is None:
             num_processes = multiprocessing.cpu_count()
-        
+    
         file_size = os.path.getsize(file_path)
         chunk_size = max(file_size // num_processes, 5*1024*1024)  # At least 5MB chunks
-        
+    
         # Create chunks based on file size
         chunks = []
         for i in range(0, file_size, chunk_size):
-            chunks.append((i, min(chunk_size, file_size - i)))
-        
-        # Function to calculate checksum for a chunk
-        def chunk_checksum(start, size):
-            md5 = hashlib.md5()
-            with open(file_path, 'rb') as f:
-                f.seek(start)
-                chunk = f.read(size)
-            md5.update(chunk)
-            return md5.digest()
-        
-        # Process chunks in parallel
+            chunks.append((file_path, i, min(chunk_size, file_size - i)))
+    
+        # Process chunks in parallel using the global function
         with multiprocessing.Pool(processes=num_processes) as pool:
-            results = pool.starmap(chunk_checksum, chunks)
-        
+            results = pool.map(_chunk_checksum, chunks)
+    
         # Combine checksums
         final_md5 = hashlib.md5()
         for digest in results:
             final_md5.update(digest)
-        
+    
         return final_md5.hexdigest()
         
     def calculate_xxhash(self, file_path, chunk_size=8192):
