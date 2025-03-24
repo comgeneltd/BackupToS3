@@ -25,8 +25,6 @@
 # After syncing, review files that exist only in S3 
 ./s3backup.sh --list-index --s3-only
 
-# Run a backup to upload only the missing files
-./s3backup.sh --run-now
 ```
 
 ## Testing and Reporting
@@ -60,6 +58,7 @@ BackupToS3 includes several configuration options to optimize performance for di
 
 ```ini
 [General]
+- [Checksum Configuration Parameters](docs/checksum-config.md)
 # Size threshold for using multipart upload (default: 8MB)
 multipart_threshold = 8388608
 

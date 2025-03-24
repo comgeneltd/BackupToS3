@@ -46,7 +46,12 @@ sudo yum install -y python3 python3-pip python3-devel samba-client-libs samba-cl
 
 4. Install required Python packages:
    ```bash
-   pip install boto3 pysmb pandas schedule configparser cryptography
+   pip install boto3 pysmb pandas schedule configparser cryptography xxhash
+
+   # If you plan to use O365 for notifications:
+    pip install azure-identity msgraph-core
+
+    deactivate
    ```
 
 5. Create a wrapper script for convenience:

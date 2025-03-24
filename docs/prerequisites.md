@@ -21,22 +21,6 @@ sudo apt install -y python3 python3-pip python3-venv smbclient libsmbclient-dev 
 sudo yum install -y python3 python3-pip python3-devel samba-client-libs samba-client
 ```
 
-## Required Python Packages
-
-The following Python packages are needed:
-
-```bash
-# Create and activate virtual environment
-python3 -m venv s3backup_env
-source s3backup_env/bin/activate
-
-# Install dependencies
-pip install boto3 pysmb pandas schedule configparser cryptography xxhash
-# If you plan to use O365 for notifications:
-pip install azure-identity msgraph-core
-
-deactivate
-```
 
 ## AWS Requirements
 
