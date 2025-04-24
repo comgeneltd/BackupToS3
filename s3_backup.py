@@ -1645,7 +1645,8 @@ class S3Manager:
         # If a global prefix is specified, it becomes: prefix/share_key_from_config/path/to/file
         share_name = file_info['share_config']['local_name']
         file_path = file_info['share_path'].lstrip('/')
-        
+        if file_path.startswith(share_name + '/'):
+            file_path = file_path[len(share_name)+1:]
         if self.config.s3_prefix:
             s3_key = f"{self.config.s3_prefix.rstrip('/')}/{share_name}/{file_path}"
         else:
