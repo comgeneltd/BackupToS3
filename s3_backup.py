@@ -1384,6 +1384,9 @@ class ShareScanner:
                             retry_count = getattr(self.db_manager.config, 'checksum_retry_count', retry_count)
                         checksum = self.smart_checksum(full_path, retry_count=retry_count)
                         
+                        share_name = self.share_config['local_name']
+                        if full_path.startswith(share_name + '/'):
+                            full_path = full_path[len(share_name)+1:]
                         # Yield the file information
                         yield {
                             'local_path': local_path,
