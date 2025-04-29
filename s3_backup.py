@@ -1646,14 +1646,11 @@ class S3Manager:
         # Create a structure like: share_key_from_config/path/to/file
         # The share_key_from_config is the key name used in the config.ini [Shares] section
         # If a global prefix is specified, it becomes: prefix/share_key_from_config/path/to/file
-        share_name = file_info['share_config']['local_name']
         file_path = file_info['share_path'].lstrip('/')
-        if file_path.startswith(share_name + '/'):
-            file_path = file_path[len(share_name)+1:]
         if self.config.s3_prefix:
-            s3_key = f"{self.config.s3_prefix.rstrip('/')}/{share_name}/{file_path}"
+            s3_key = f"{self.config.s3_prefix.rstrip('/')}/{file_path}"
         else:
-            s3_key = f"{share_name}/{file_path}"
+            s3_key = file_path
             
         return s3_key
     
