@@ -525,9 +525,31 @@ class DatabaseManager:
         self.initialize_db()
     
     def get_connection(self):
-        """Get a thread-local database connection."""
+        """
+        Get a thread-local database connection with optimized memory settings.
+        """
         if not hasattr(threading.current_thread(), '_db_conn'):
-            threading.current_thread()._db_conn = sqlite3.connect(self.db_path)
+            # Create a new connection for this thread with optimized settings
+            conn = sqlite3.connect(self.db_path, timeout=30)
+            
+            # Configure for thread-specific usage
+            cursor = conn.cursor()
+            
+            # Set synchronous mode to NORMAL for better performance 
+            cursor.execute("PRAGMA synchronous = NORMAL")
+            
+            # Limit cache size to control memory usage
+            cursor.execute("PRAGMA cache_size = -4000")  # 4MB per thread connection
+            
+            # Use memory for temp store if memory allows, otherwise file
+            cursor.execute("PRAGMA temp_store = FILE")
+            
+            # Disable memory mapping for lower memory usage
+            cursor.execute("PRAGMA mmap_size = 0")
+            
+            # Store the connection
+            threading.current_thread()._db_conn = conn
+            
         return threading.current_thread()._db_conn
     
     def initialize_db(self):
@@ -797,7 +819,67 @@ class DatabaseManager:
         except sqlite3.Error as e:
             logger.error(f"Error finishing backup run: {str(e)}")
             return False
-
+        
+    def vacuum_database(self):
+        """
+        Run VACUUM on the database to optimize storage and reclaim space.
+        This should be run periodically, but not during high load periods.
+        """
+        logger.info("Starting database VACUUM operation (this may take a while)...")
+        try:
+            # First run an integrity check
+            with self.lock:
+                conn = self.get_connection()
+                cursor = conn.cursor()
+                
+                # Check integrity before VACUUM
+                cursor.execute("PRAGMA integrity_check")
+                integrity_result = cursor.fetchone()[0]
+                
+                if integrity_result != "ok":
+                    logger.error(f"Database integrity check failed: {integrity_result}")
+                    return False
+                
+                # Run VACUUM
+                start_time = time.time()
+                
+                # Get database size before VACUUM
+                if os.path.exists(self.db_path):
+                    db_size_before = os.path.getsize(self.db_path)
+                else:
+                    db_size_before = 0
+                
+                # VACUUM cannot run in WAL mode, so switch to DELETE mode temporarily
+                cursor.execute("PRAGMA journal_mode = DELETE")
+                
+                # Run the VACUUM
+                cursor.execute("VACUUM")
+                
+                # Switch back to WAL mode
+                cursor.execute("PRAGMA journal_mode = WAL")
+                
+                # Get database size after VACUUM
+                if os.path.exists(self.db_path):
+                    db_size_after = os.path.getsize(self.db_path)
+                else:
+                    db_size_after = 0
+                
+                # Calculate size reduction
+                size_reduction = db_size_before - db_size_after
+                
+                # Log completion
+                elapsed_time = time.time() - start_time
+                logger.info(f"Database VACUUM completed in {elapsed_time:.2f} seconds")
+                logger.info(f"Database size: {format_size(db_size_before)} -> {format_size(db_size_after)}")
+                logger.info(f"Space reclaimed: {format_size(size_reduction)}")
+                
+                # Run ANALYZE to update statistics
+                cursor.execute("ANALYZE")
+                
+                return True
+        except sqlite3.Error as e:
+            logger.error(f"Error during database VACUUM: {str(e)}")
+            return False
 def _chunk_checksum(args):
     """Calculate checksum for a chunk of a file.
     Args:
@@ -1132,7 +1214,7 @@ class ShareScanner:
             raise FileNotFoundError(f"File not found and no SMB connection available: {file_path}")
     
     def smart_checksum(self, file_path, retry_count=3, parallel=True):
-        """Smart checksum with optimized handling for large files."""
+        """Smart checksum with optimized handling for large files and improved memory efficiency."""
         
         start_time = time.time()
         
@@ -1169,49 +1251,50 @@ class ShareScanner:
                         if file_size > partial_checksum_threshold:
                             logger.info(f"Using smart partial checksum for large file: {file_path} ({format_size(file_size)})")
                             
-                            # Variables for gathering partial content
-                            file_parts = []
-                            
-                            # Sample beginning of file (first 256KB)
+                            # Use an efficient sampling approach for large files
+                            # Sample beginning of file (first 128KB)
                             begin_buffer = io.BytesIO()
-                            self.conn.retrieveFileFromOffset(share_name, file_path_rel, begin_buffer, 0, 262144)
+                            self.conn.retrieveFileFromOffset(share_name, file_path_rel, begin_buffer, 0, 131072)
                             begin_buffer.seek(0)
-                            file_parts.append(begin_buffer.getvalue())
+                            begin_data = begin_buffer.read()
+                            begin_buffer.close()  # Explicitly close to free memory
                             
-                            # Sample middle of file (256KB from middle)
-                            middle_offset = max(file_size // 2 - 131072, 262144)
+                            # Sample middle of file (128KB from middle)
+                            middle_offset = max(file_size // 2 - 65536, 131072)
                             middle_buffer = io.BytesIO()
-                            self.conn.retrieveFileFromOffset(share_name, file_path_rel, middle_buffer, middle_offset, 262144)
+                            self.conn.retrieveFileFromOffset(share_name, file_path_rel, middle_buffer, middle_offset, 131072)
                             middle_buffer.seek(0)
-                            file_parts.append(middle_buffer.getvalue())
+                            middle_data = middle_buffer.read()
+                            middle_buffer.close()  # Explicitly close to free memory
                             
-                            # Sample end of file (last 256KB)
-                            end_offset = max(file_size - 262144, middle_offset + 262144)
+                            # Sample end of file (last 128KB)
+                            end_offset = max(file_size - 131072, middle_offset + 131072)
                             end_buffer = io.BytesIO()
-                            self.conn.retrieveFileFromOffset(share_name, file_path_rel, end_buffer, end_offset, 262144)
+                            self.conn.retrieveFileFromOffset(share_name, file_path_rel, end_buffer, end_offset, 131072)
                             end_buffer.seek(0)
-                            file_parts.append(end_buffer.getvalue())
+                            end_data = end_buffer.read()
+                            end_buffer.close()  # Explicitly close to free memory
                             
                             # Calculate MD5 of the sampled parts
                             composite_md5 = hashlib.md5()
-                            for part in file_parts:
-                                composite_md5.update(part)
+                            composite_md5.update(begin_data)
+                            composite_md5.update(middle_data)
+                            composite_md5.update(end_data)
+                            
+                            # Clear large data variables to free memory
+                            del begin_data
+                            del middle_data
+                            del end_data
                             
                             # Create a composite fingerprint with metadata
                             fingerprint = f"partial-{file_size}-{file_attr.last_write_time}-{composite_md5.hexdigest()}"
                             logger.info(f"Generated partial checksum in {time.time() - start_time:.2f} seconds")
                             return fingerprint
                             
-                        # MEDIUM FILE STRATEGY (50MB to 500MB) - use parallel checksumming
-                        elif file_size > medium_file_threshold and parallel:
-                            # Download file to temp and use parallel checksum
-                            temp_path = self.get_temp_file(file_path_rel, os.path.basename(file_path_rel))
-                            try:
-                                return self.parallel_checksum(temp_path)
-                            finally:
-                                if os.path.exists(temp_path):
-                                    os.unlink(temp_path)
-                                    
+                        # MEDIUM FILE STRATEGY (50MB to 500MB) - use streaming checksum
+                        elif file_size > medium_file_threshold:
+                            return self.calculate_streaming_checksum(file_path)
+                            
                         # SMALL FILE STRATEGY - use standard checksumming
                         else:
                             return self.calculate_streaming_checksum(file_path)
@@ -1238,22 +1321,22 @@ class ShareScanner:
                         partial_checksum_threshold = getattr(config, 'partial_checksum_threshold', partial_checksum_threshold)
                         medium_file_threshold = getattr(config, 'medium_file_threshold', medium_file_threshold)
                     
-                    # Large file strategy
+                    # Large file strategy - sample 128KB from begin, middle, and end
                     if file_size > partial_checksum_threshold:
                         logger.info(f"Using partial checksum for large local file: {file_path}")
                         
                         # Sample beginning, middle and end
                         with open(file_path, 'rb') as f:
                             # Read beginning
-                            begin_data = f.read(262144)
+                            begin_data = f.read(131072)
                             
                             # Read middle
-                            f.seek(max(file_size // 2 - 131072, 262144))
-                            middle_data = f.read(262144)
+                            f.seek(max(file_size // 2 - 65536, 131072))
+                            middle_data = f.read(131072)
                             
                             # Read end
-                            f.seek(max(file_size - 262144, 0))
-                            end_data = f.read(262144)
+                            f.seek(max(file_size - 131072, 0))
+                            end_data = f.read(131072)
                         
                         # Combine into composite checksum
                         composite_md5 = hashlib.md5()
@@ -1261,20 +1344,34 @@ class ShareScanner:
                         composite_md5.update(middle_data)
                         composite_md5.update(end_data)
                         
+                        # Clear large data variables
+                        del begin_data
+                        del middle_data
+                        del end_data
+                        
                         # Create fingerprint with metadata
                         mtime = os.path.getmtime(file_path)
                         fingerprint = f"partial-{file_size}-{mtime}-{composite_md5.hexdigest()}"
                         logger.info(f"Generated partial checksum in {time.time() - start_time:.2f} seconds")
                         return fingerprint
                     
-                    # Medium files
-                    elif file_size > medium_file_threshold and parallel:
-                        return self.parallel_checksum(file_path)
+                    # Medium files - use streaming approach
+                    elif file_size > medium_file_threshold:
+                        # Use a memory-efficient streaming approach
+                        md5 = hashlib.md5()
+                        with open(file_path, 'rb') as f:
+                            for chunk in iter(lambda: f.read(8192), b''):
+                                md5.update(chunk)
+                        return md5.hexdigest()
                     
                     # Small files
                     else:
+                        # Use standard approach for small files
+                        md5 = hashlib.md5()
                         with open(file_path, 'rb') as f:
-                            return self.calculate_checksum(f)
+                            for chunk in iter(lambda: f.read(8192), b''):
+                                md5.update(chunk)
+                        return md5.hexdigest()
                 
             except FileNotFoundError as e:
                 if attempt == retry_count - 1:
@@ -1294,20 +1391,48 @@ class ShareScanner:
     
     def calculate_streaming_checksum(self, file_path):
         """Calculate MD5 checksum by streaming the file without saving to disk."""
-        import tempfile
         md5 = hashlib.md5()
-        file_obj = tempfile.SpooledTemporaryFile(max_size=10*1024*1024)  # 10MB in-memory buffer
+        chunk_size = 8192  # Use 8KB chunks instead of loading the entire file
         
         try:
-            self.conn.retrieveFile(self.share_config['name'], file_path, file_obj)
-            file_obj.seek(0)
+            # Extract share name and file path
+            share_name, file_path_rel = self.extract_share_path(file_path)
             
-            for chunk in iter(lambda: file_obj.read(8192), b''):
-                md5.update(chunk)
+            # Use retrieveFileFromOffset for memory-efficient streaming
+            offset = 0
+            while True:
+                # Create a small buffer just for this chunk
+                buffer = io.BytesIO()
                 
-            return md5.hexdigest()
-        finally:
-            file_obj.close()
+                # Read a chunk from offset
+                bytes_read = self.conn.retrieveFileFromOffset(
+                    share_name, 
+                    file_path_rel, 
+                    buffer, 
+                    offset, 
+                    chunk_size
+                )
+                
+                # If we didn't read anything, we're done
+                if bytes_read == 0:
+                    break
+                    
+                # Update the hash with this chunk
+                buffer.seek(0)
+                data = buffer.read()
+                md5.update(data)
+                
+                # Move to next chunk
+                offset += bytes_read
+                
+                # Free the buffer memory
+                buffer.close()
+                
+        except Exception as e:
+            logger.error(f"Error in streaming checksum calculation: {str(e)}")
+            raise
+            
+        return md5.hexdigest()
     
     def get_temp_file(self, path, filename):
         """Download a file to a temporary location and return the path."""
@@ -1319,88 +1444,122 @@ class ShareScanner:
         return temp_path
     
     def scan_directory(self, path='', recursive=True):
-        """Scan a directory on the share and yield file information."""
+        """Scan a directory on the share and yield file information with improved memory efficiency."""
         if not self.conn:
             if not self.connect():
                 logger.error("Not connected to share. Scan failed.")
                 return
         
         try:
-            files = self.conn.listPath(self.share_config['name'], path)
+            # Process directories in a more memory-efficient way
+            # We'll use a queue-based approach instead of recursion
+            from collections import deque
+            directories_to_process = deque([(path, 0)])  # (path, depth)
+            max_depth = 100  # Safety limit to prevent infinite loops
             
-            for file_info in files:
-                file_name = file_info.filename
+            while directories_to_process:
+                current_path, depth = directories_to_process.popleft()
                 
-                # Skip '.' and '..' directories
-                if file_name in ['.', '..']:
+                # Safety check for max depth
+                if depth > max_depth:
+                    logger.warning(f"Max directory depth reached for {current_path}, skipping deeper traversal")
                     continue
                 
-                # Calculate the full path
-                full_path = os.path.join(path, file_name) if path else file_name
-                
-                # If it's a directory and recursion is enabled, scan it
-                if file_info.isDirectory and recursive:
-                    try:
-                        yield from self.scan_directory(full_path, recursive)
-                    except Exception as e:
-                        error_msg = f"Failed to list {full_path} on {self.share_config['name']}: {str(e)}"
-                        logger.error(f"Error scanning directory {full_path}: {str(e)}")
-                        # Create an error record that can be included in reports
-                        yield {
-                            'error': True,
-                            'path': full_path,
-                            'message': error_msg,
-                            'share_config': self.share_config
-                        }
-                # If it's a file, yield its information
-                elif not file_info.isDirectory:
-                    # Generate a unique identifier for the file
-                    local_path = f"{self.share_config['local_name']}:{full_path}"
+                try:
+                    # List files in the current directory
+                    files = self.conn.listPath(self.share_config['name'], current_path)
                     
-                    # Check if file has changed by comparing modification time and size
-                    existing_file = self.db_manager.get_file_by_path(local_path)
-                    
-                    # Convert Windows file time to Unix timestamp
-                    last_modified = datetime.datetime.fromtimestamp(file_info.last_write_time)
-                    
-                    # Get the uploaded_to_s3 flag (0 = not uploaded, 1 = uploaded)
-                    uploaded_to_s3 = 0
-                    if existing_file and len(existing_file) >= 12:  # Make sure the field exists
-                        uploaded_to_s3 = existing_file[11]
+                    for file_info in files:
+                        file_name = file_info.filename
                         
-                    # Only skip if file exists, hasn't changed AND has been uploaded to S3
-                    if existing_file and int(existing_file[3]) == file_info.file_size and \
-                       existing_file[4] == last_modified.isoformat() and uploaded_to_s3 == 1:
-                        continue
+                        # Skip '.' and '..' directories
+                        if file_name in ['.', '..']:
+                            continue
+                        
+                        # Calculate the full path
+                        full_path = os.path.join(current_path, file_name) if current_path else file_name
+                        
+                        # If it's a directory and recursion is enabled, add to the queue
+                        if file_info.isDirectory and recursive:
+                            directories_to_process.append((full_path, depth + 1))
+                        # If it's a file, yield its information
+                        elif not file_info.isDirectory:
+                            # Generate a unique identifier for the file
+                            local_path = f"{self.share_config['local_name']}:{full_path}"
+                            
+                            # Check if file has changed by comparing modification time and size
+                            existing_file = self.db_manager.get_file_by_path(local_path)
+                            
+                            # Convert Windows file time to Unix timestamp
+                            last_modified = datetime.datetime.fromtimestamp(file_info.last_write_time)
+                            
+                            # Get the uploaded_to_s3 flag (0 = not uploaded, 1 = uploaded)
+                            uploaded_to_s3 = 0
+                            if existing_file and len(existing_file) >= 12:  # Make sure the field exists
+                                uploaded_to_s3 = existing_file[11]
+                                
+                            # Only skip if file exists, hasn't changed AND has been uploaded to S3
+                            if existing_file and int(existing_file[3]) == file_info.file_size and \
+                               existing_file[4] == last_modified.isoformat() and uploaded_to_s3 == 1:
+                                continue
+                            
+                            # For changed or new files, calculate checksum
+                            try:
+                                # Calculate checksum using the most efficient method based on file size with retries
+                                # Get retry count from config if available
+                                retry_count = 3  # Default value
+                                
+                                # Try to get config from db_manager if available
+                                if hasattr(self.db_manager, 'config') and self.db_manager.config:
+                                    retry_count = getattr(self.db_manager.config, 'checksum_retry_count', retry_count)
+                                checksum = self.smart_checksum(full_path, retry_count=retry_count)
+                                
+                                share_name = self.share_config['local_name']
+                                if full_path.startswith(share_name + '/'):
+                                    full_path = full_path[len(share_name)+1:]
+                                # Yield the file information
+                                yield {
+                                    'local_path': local_path,
+                                    'share_path': full_path,
+                                    'size': file_info.file_size,
+                                    'last_modified': last_modified,
+                                    'checksum': checksum,
+                                    'share_config': self.share_config,
+                                    'file_name': file_name  # Add filename for proper comparison
+                                }
+                                
+                                # Explicitly trigger garbage collection for large directories
+                                if depth > 5:  # Only for deep directories
+                                    # Clean up any pending connections for GC
+                                    import gc
+                                    gc.collect()
+                                    
+                            except Exception as e:
+                                logger.error(f"Error processing file {full_path}: {str(e)}")
+                                
+                except Exception as e:
+                    error_msg = f"Failed to list {current_path} on {self.share_config['name']}: {str(e)}"
+                    logger.error(f"Error scanning directory {current_path}: {str(e)}")
+                    # Create an error record that can be included in reports
+                    yield {
+                        'error': True,
+                        'path': current_path,
+                        'message': error_msg,
+                        'share_config': self.share_config
+                    }
                     
-                    # For changed or new files, calculate checksum
-                    try:
-                        # Calculate checksum using the most efficient method based on file size with retries
-                        # Get retry count from config if available
-                        retry_count = 3  # Default value
-                        
-                        # Try to get config from db_manager if available
-                        if hasattr(self.db_manager, 'config') and self.db_manager.config:
-                            retry_count = getattr(self.db_manager.config, 'checksum_retry_count', retry_count)
-                        checksum = self.smart_checksum(full_path, retry_count=retry_count)
-                        
-                        share_name = self.share_config['local_name']
-                        if full_path.startswith(share_name + '/'):
-                            full_path = full_path[len(share_name)+1:]
-                        # Yield the file information
-                        yield {
-                            'local_path': local_path,
-                            'share_path': full_path,
-                            'size': file_info.file_size,
-                            'last_modified': last_modified,
-                            'checksum': checksum,
-                            'share_config': self.share_config,
-                            'file_name': file_name  # Add filename for proper comparison
-                        }
-                    except Exception as e:
-                        logger.error(f"Error processing file {full_path}: {str(e)}")
         except Exception as e:
-            logger.error(f"Error scanning directory {path}: {str(e)}")
+            logger.error(f"Error scanning directories: {str(e)}")
+            # Try to recover the connection if it was dropped
+            try:
+                logger.info("Attempting to reconnect...")
+                self.disconnect()
+                if self.connect():
+                    logger.info("Successfully reconnected")
+                else:
+                    logger.error("Failed to reconnect")
+            except Exception as reconnect_error:
+                logger.error(f"Error during reconnection attempt: {str(reconnect_error)}")
 
 
 class S3Manager:
@@ -2023,11 +2182,11 @@ class BackupManager:
     
     def sync_index_with_aws(self):
         """
-        Synchronize index with both AWS S3 and Windows shares.
+        Synchronize index with both AWS S3 and Windows shares using memory-efficient batching.
         This builds a comprehensive index without uploading any files,
         perfect for migrating from another backup solution.
         """
-        logger.info("Synchronizing index with AWS S3 and Windows shares...")
+        logger.info("Synchronizing index with AWS S3 and Windows shares (memory-optimized)...")
         
         # Initialize counters
         files_indexed_s3 = 0
@@ -2035,72 +2194,109 @@ class BackupManager:
         files_matched = 0
         s3_only_files = 0
         
-        # Step 1: Index files from S3 first
-        logger.info("Indexing files from AWS S3...")
-        s3_files = {}  # Dictionary to track S3 files by path
+        # Dictionary to track statistics by share for reporting
+        share_stats = {}
+        
+        # Step 1: Process S3 objects in memory-efficient batches
+        logger.info("Indexing files from AWS S3 using batched processing...")
+        
+        # Initialize batch counter and batch size
+        batch_size = 1000  # Process 1000 objects at a time
+        s3_batch = []
         
         try:
-            for obj in self.s3_manager.list_objects():
-                s3_key = obj['Key']
-                
-                # If a prefix is configured, handle it properly
-                if self.config.s3_prefix:
-                    prefix = self.config.s3_prefix.rstrip('/')
-                    if not s3_key.startswith(prefix + '/'):
-                        continue
-                    # Extract share name and path from S3 key with prefix
-                    path_parts = s3_key[len(prefix) + 1:].split('/', 1)
-                else:
-                    # No prefix, so format is: share_name/path/to/file
-                    path_parts = s3_key.split('/', 1)
-                
-                if len(path_parts) != 2:
+            # Create a paginator for efficient S3 listing
+            paginator = self.s3_manager.s3_client.get_paginator('list_objects_v2')
+            
+            # Process S3 objects in pages
+            for page in paginator.paginate(Bucket=self.config.s3_bucket, Prefix=self.config.s3_prefix):
+                if 'Contents' not in page:
                     continue
+                    
+                for obj in page['Contents']:
+                    s3_key = obj['Key']
+                    
+                    # If a prefix is configured, handle it properly
+                    if self.config.s3_prefix:
+                        prefix = self.config.s3_prefix.rstrip('/')
+                        if not s3_key.startswith(prefix + '/'):
+                            continue
+                        # Extract share name and path from S3 key with prefix
+                        path_parts = s3_key[len(prefix) + 1:].split('/', 1)
+                    else:
+                        # No prefix, so format is: share_name/path/to/file
+                        path_parts = s3_key.split('/', 1)
+                    
+                    if len(path_parts) != 2:
+                        continue
+                    
+                    share_name, file_path = path_parts
+                    local_path = f"{share_name}:{file_path}"
+                    
+                    # Update share stats
+                    if share_name not in share_stats:
+                        share_stats[share_name] = {
+                            'total': 0,
+                            'matched': 0,
+                            'new': 0,
+                            's3_only': 0
+                        }
+                    
+                    # Add to the current batch
+                    s3_batch.append({
+                        'local_path': local_path,
+                        's3_path': s3_key,
+                        'size': obj['Size'],
+                        'last_modified': obj['LastModified'].isoformat(),
+                        'checksum': "s3_indexed",  # Placeholder to be updated later if file exists
+                        'share_name': share_name
+                    })
+                    
+                    files_indexed_s3 += 1
+                    
+                    # When batch reaches the specified size, process and clear it
+                    if len(s3_batch) >= batch_size:
+                        self._process_s3_batch(s3_batch)
+                        
+                        # Log progress and reset batch
+                        logger.info(f"Processed {files_indexed_s3} S3 objects")
+                        s3_batch = []
+                        
+                        # Explicitly trigger garbage collection to free memory
+                        import gc
+                        gc.collect()
                 
-                share_name, file_path = path_parts
-                local_path = f"{share_name}:{file_path}"
-                
-                # Store in our tracking dictionary
-                s3_files[local_path] = {
-                    's3_path': s3_key,
-                    'size': obj['Size'],
-                    'last_modified': obj['LastModified'].isoformat()
-                }
-                
-                # Add to database with placeholder checksum
-                self.db_manager.add_file(
-                    local_path=local_path,
-                    s3_path=s3_key,
-                    size=obj['Size'],
-                    last_modified=obj['LastModified'].isoformat(),
-                    checksum="s3_indexed",  # Placeholder to be updated later if file exists
-                    previous_path=None,
-                    moved_in_s3=0
-                )
-                
-                files_indexed_s3 += 1
-                
-                if files_indexed_s3 % 1000 == 0:
-                    logger.info(f"Indexed {files_indexed_s3} files from S3 so far")
-        
+                # After each page, process any remaining items in the current batch
+                if s3_batch:
+                    self._process_s3_batch(s3_batch)
+                    logger.info(f"Processed {files_indexed_s3} S3 objects")
+                    s3_batch = []
+                    import gc
+                    gc.collect()
+                    
         except Exception as e:
             logger.error(f"Error indexing S3: {str(e)}")
+            # Process any remaining items in the batch before exiting
+            if s3_batch:
+                self._process_s3_batch(s3_batch)
         
         logger.info(f"Indexed {files_indexed_s3} files from S3")
         
         # Step 2: Scan Windows shares to update checksums and match with S3 files
         logger.info("Scanning Windows shares to match with S3 index...")
         
-        # Dictionary to track files by share for reporting
-        share_stats = {}
-        
+        # Process each share
         for share_config in self.config.shares:
             share_name = share_config['local_name']
-            share_stats[share_name] = {
-                'total': 0,
-                'matched': 0,
-                'new': 0
-            }
+            
+            # Initialize stats for this share if needed
+            if share_name not in share_stats:
+                share_stats[share_name] = {
+                    'total': 0,
+                    'matched': 0,
+                    'new': 0,
+                    's3_only': 0
+                }
             
             scanner = ShareScanner(share_config, self.db_manager)
             try:
@@ -2109,78 +2305,115 @@ class BackupManager:
                     continue
                     
                 # Scan files in the share
+                files_in_this_share = 0
                 for item in scanner.scan_directory():
                     # Skip error records
                     if 'error' in item and item['error']:
                         continue
                         
-                    # Process file info
-                    file_info = item
-                    files_indexed_shares += 1
-                    share_stats[share_name]['total'] += 1
-                    
-                    local_path = file_info['local_path']
-                    
-                    # Check if this file exists in S3
-                    if local_path in s3_files:
-                        # We have a match! Update the database with the checksum
-                        self.db_manager.add_file(
-                            local_path=local_path,
-                            s3_path=s3_files[local_path]['s3_path'],
-                            size=file_info['size'],
-                            last_modified=file_info['last_modified'].isoformat(),
-                            checksum=file_info['checksum'],
-                            previous_path=None,
-                            moved_in_s3=0,
-                            file_name=file_info['file_name']
-                        )
-                        files_matched += 1
-                        share_stats[share_name]['matched'] += 1
-                    else:
-                        # File exists in share but not in S3
-                        # Generate S3 key for this file
-                        s3_key = self.s3_manager.generate_s3_key(file_info)
+                    # Process file info in a memory-efficient way
+                    try:
+                        # Process file info
+                        file_info = item
+                        files_indexed_shares += 1
+                        files_in_this_share += 1
+                        share_stats[share_name]['total'] += 1
                         
-                        # Add to database (will need to be uploaded later)
-                        self.db_manager.add_file(
-                            local_path=local_path,
-                            s3_path=s3_key,
-                            size=file_info['size'],
-                            last_modified=file_info['last_modified'].isoformat(),
-                            checksum=file_info['checksum'],
-                            previous_path=None,
-                            moved_in_s3=0,
-                            file_name=file_info['file_name']
-                        )
-                        share_stats[share_name]['new'] += 1
-                    
-                    if files_indexed_shares % 1000 == 0:
-                        logger.info(f"Processed {files_indexed_shares} files from shares so far")
-            
+                        local_path = file_info['local_path']
+                        
+                        # Check if this file exists in S3 by querying the database
+                        with self.db_manager.lock:
+                            conn = self.db_manager.get_connection()
+                            cursor = conn.cursor()
+                            cursor.execute(
+                                "SELECT s3_path FROM files WHERE local_path=? AND checksum='s3_indexed'",
+                                (local_path,)
+                            )
+                            match = cursor.fetchone()
+                        
+                        if match:
+                            # We have a match! Update the database with the checksum
+                            s3_path = match[0]
+                            self.db_manager.add_file(
+                                local_path=local_path,
+                                s3_path=s3_path,
+                                size=file_info['size'],
+                                last_modified=file_info['last_modified'].isoformat(),
+                                checksum=file_info['checksum'],
+                                previous_path=None,
+                                moved_in_s3=0,
+                                file_name=file_info['file_name']
+                            )
+                            files_matched += 1
+                            share_stats[share_name]['matched'] += 1
+                        else:
+                            # File exists in share but not in S3
+                            # Generate S3 key for this file
+                            s3_key = self.s3_manager.generate_s3_key(file_info)
+                            
+                            # Add to database (will need to be uploaded later)
+                            self.db_manager.add_file(
+                                local_path=local_path,
+                                s3_path=s3_key,
+                                size=file_info['size'],
+                                last_modified=file_info['last_modified'].isoformat(),
+                                checksum=file_info['checksum'],
+                                previous_path=None,
+                                moved_in_s3=0,
+                                file_name=file_info['file_name']
+                            )
+                            share_stats[share_name]['new'] += 1
+                        
+                        # Periodically log progress and trigger garbage collection
+                        if files_indexed_shares % 1000 == 0:
+                            logger.info(f"Processed {files_indexed_shares} files from shares so far")
+                            import gc
+                            gc.collect()
+                            
+                    except Exception as e:
+                        logger.error(f"Error processing file {item.get('local_path', 'unknown')}: {str(e)}")
+                
+                logger.info(f"Processed {files_in_this_share} files from share {share_name}")
+                
             except Exception as e:
                 logger.error(f"Error scanning share {share_name}: {str(e)}")
             finally:
                 scanner.disconnect()
+                # Trigger garbage collection after processing each share
+                import gc
+                gc.collect()
         
         # Step 3: Mark files that exist in S3 but not in shares as "s3_only"
-        # First, get all files with placeholder checksums
-        with self.db_manager.lock:
-            conn = self.db_manager.get_connection()
-            cursor = conn.cursor()
-            cursor.execute("SELECT local_path FROM files WHERE checksum='s3_indexed'")
-            s3_only = cursor.fetchall()
-            
-            for row in s3_only:
-                local_path = row[0]
-                s3_only_files += 1
+        # Use an efficient SQL-based approach instead of loading all data into memory
+        logger.info("Identifying S3-only files...")
+        
+        try:
+            with self.db_manager.lock:
+                conn = self.db_manager.get_connection()
+                cursor = conn.cursor()
                 
-                # Update these with a special flag to indicate they're only in S3
+                # Update in batches to avoid memory issues
                 cursor.execute(
-                    "UPDATE files SET checksum='s3_only' WHERE local_path=?", 
-                    (local_path,)
+                    "UPDATE files SET checksum='s3_only' WHERE checksum='s3_indexed'"
                 )
-            
-            conn.commit()
+                s3_only_files = cursor.rowcount
+                conn.commit()
+                
+                # Update share stats with s3_only counts
+                cursor.execute("""
+                    SELECT substr(local_path, 1, instr(local_path, ':')-1) as share_name, COUNT(*) 
+                    FROM files 
+                    WHERE checksum='s3_only' 
+                    GROUP BY share_name
+                """)
+                
+                for row in cursor.fetchall():
+                    share_name, count = row
+                    if share_name in share_stats:
+                        share_stats[share_name]['s3_only'] = count
+        
+        except Exception as e:
+            logger.error(f"Error updating S3-only files: {str(e)}")
         
         # Generate summary report
         report = f"""
@@ -2197,17 +2430,18 @@ Share-by-Share Statistics:
         for share_name, stats in share_stats.items():
             report += f"""
 {share_name}:
-  - Total files: {stats['total']}
-  - Matched with S3: {stats['matched']}
-  - New files (to be uploaded): {stats['new']}
+  - Total files: {stats.get('total', 0)}
+  - Matched with S3: {stats.get('matched', 0)}
+  - New files (to be uploaded): {stats.get('new', 0)}
+  - Existing only in S3: {stats.get('s3_only', 0)}
 """
         
         report += """
 Next Steps:
 ----------
-1. Review the index with: python s3_backup.py --list-index
-2. Run a backup to upload new files: python s3_backup.py --run-now
-3. To see files that exist only in S3: python s3_backup.py --list-index --s3-only
+1. Review the index with: ./s3backup.sh --list-index
+2. Run a backup to upload new files: ./s3backup.sh --run-now
+3. To see files that exist only in S3: ./s3backup.sh --list-index --s3-only
 """
         
         logger.info(report)
@@ -2220,60 +2454,17 @@ Next Steps:
                 body=report
             )
         
-        # Create a CSV report of the synchronization
-        report_file = os.path.join(
-            self.config.report_path, 
-            f'aws_sync_report_{datetime.datetime.now().strftime("%Y%m%d_%H%M%S")}.csv'
-        )
-        
-        try:
-            with open(report_file, 'w', newline='') as csvfile:
-                writer = csv.writer(csvfile)
-                writer.writerow(['Location', 'Share', 'Path', 'Size', 'Last Modified'])
-                
-                # Use a thread-safe connection
-                with self.db_manager.lock:
-                    conn = self.db_manager.get_connection()
-                    cursor = conn.cursor()
-                    
-                    # Files only in S3
-                    cursor.execute(
-                        "SELECT local_path, s3_path, size, last_modified FROM files WHERE checksum='s3_only'"
-                    )
-                    s3_only_files = cursor.fetchall()
-                    
-                    # Prepare query for new files
-                    new_files_by_share = {}
-                    for share_name, stats in share_stats.items():
-                        if stats['new'] > 0:
-                            cursor.execute(
-                                "SELECT local_path, size, last_modified FROM files WHERE local_path LIKE ? AND checksum != 's3_only' AND checksum != 's3_indexed'",
-                                (f"{share_name}:%",)
-                            )
-                            new_files_by_share[share_name] = cursor.fetchall()
-                
-                # Now write the results outside the lock (to minimize lock time)
-                for row in s3_only_files:
-                    local_path, s3_path, size, last_modified = row
-                    share_name = local_path.split(':', 1)[0]
-                    file_path = local_path.split(':', 1)[1] if ':' in local_path else local_path
-                    writer.writerow(['S3 Only', share_name, file_path, size, last_modified])
-                
-                # New files that need to be uploaded
-                for share_name, new_files in new_files_by_share.items():
-                    for row in new_files:
-                        local_path, size, last_modified = row
-                        file_path = local_path.split(':', 1)[1] if ':' in local_path else local_path
-                        writer.writerow(['To Upload', share_name, file_path, size, last_modified])
-            
-            logger.info(f"Detailed report saved to {report_file}")
-        except Exception as e:
-            logger.error(f"Error writing report: {str(e)}")
+        # Create a CSV report of the synchronization using a memory-efficient approach
+        self._generate_sync_report(files_indexed_s3, files_indexed_shares, files_matched, s3_only_files, share_stats)
         
         logger.info("Index synchronization completed")
-    
+        
+        # Final garbage collection
+        import gc
+        gc.collect()
+       
     def direct_stream_to_s3(self, scanner, share_path, s3_key, file_size):
-        """Stream a file directly from SMB to S3 without local storage."""
+        """Stream a file directly from SMB to S3 without local storage, with improved memory efficiency."""
         # Initialize multipart upload
         response = self.s3_manager.s3_client.create_multipart_upload(
             Bucket=self.config.s3_bucket,
@@ -2284,7 +2475,13 @@ Next Steps:
         
         try:
             # Calculate optimal part size (min 5MB, aim for reasonable number of parts)
-            part_size = max(5 * 1024 * 1024, min(100 * 1024 * 1024, file_size // 10))
+            # For larger files, use larger part sizes to reduce the number of requests
+            if file_size > 5 * 1024 * 1024 * 1024:  # 5GB
+                part_size = 100 * 1024 * 1024  # 100MB chunks for very large files
+            elif file_size > 1024 * 1024 * 1024:  # 1GB
+                part_size = 50 * 1024 * 1024  # 50MB chunks for large files
+            else:
+                part_size = max(5 * 1024 * 1024, min(25 * 1024 * 1024, file_size // 10))
             
             # Stream in chunks directly to S3
             parts = []
@@ -2294,7 +2491,7 @@ Next Steps:
             while offset < file_size:
                 current_part_size = min(part_size, file_size - offset)
                 
-                # Create a memory buffer for this chunk
+                # Create a memory buffer for this chunk only
                 buffer = io.BytesIO()
                 
                 # Read this chunk from SMB
@@ -2307,14 +2504,21 @@ Next Steps:
                 )
                 buffer.seek(0)
                 
+                # Get the buffer content but don't keep it in two places
+                buffer_content = buffer.getvalue()
+                buffer.close()  # Close immediately to free memory
+                
                 # Upload this part to S3
                 response = self.s3_manager.s3_client.upload_part(
                     Bucket=self.config.s3_bucket,
                     Key=s3_key,
                     UploadId=upload_id,
                     PartNumber=part_number,
-                    Body=buffer.getvalue()
+                    Body=buffer_content
                 )
+                
+                # Clear the buffer content to free memory
+                del buffer_content
                 
                 # Save the ETag
                 parts.append({
@@ -2326,6 +2530,11 @@ Next Steps:
                 part_number += 1
                 offset += current_part_size
                 logger.info(f"Uploaded part {part_number-1} of {share_path} ({format_size(current_part_size)})")
+                
+                # Trigger garbage collection for very large files
+                if file_size > 1024 * 1024 * 1024:  # 1GB
+                    import gc
+                    gc.collect()
             
             # Complete the multipart upload
             self.s3_manager.s3_client.complete_multipart_upload(
@@ -2350,7 +2559,7 @@ Next Steps:
             return False
     
     def smart_process_large_file(self, file_info, s3_key):
-        """Optimized method for large files that skips redundant transfers."""
+        """Optimized method for large files that skips redundant transfers and uses less memory."""
         share_path = file_info['share_path']
         share_config = file_info['share_config']
         
@@ -2368,10 +2577,10 @@ Next Steps:
                 logger.info(f"Large file unchanged and already in S3, skipping: {file_info['local_path']}")
                 return True
         
-        # 2. For large files (>500MB by default), use a partial checksum approach
+        # 2. Choose optimized approach based on file size
         direct_upload_threshold = getattr(self.config, 'direct_upload_threshold', 500 * 1024 * 1024)
         if file_info['size'] > direct_upload_threshold:
-            logger.info(f"Using partial checksum for large file: {share_path} ({format_size(file_info['size'])})")
+            logger.info(f"Using direct streaming for large file: {share_path} ({format_size(file_info['size'])})")
             
             # Connect to share if needed
             scanner = ShareScanner(share_config, self.db_manager)
@@ -2380,8 +2589,7 @@ Next Steps:
                 return False
             
             try:
-                # Just stream directly to S3 without local temp storage
-                # This is the key optimization - we're skipping the download-then-upload pattern
+                # Stream directly to S3 without local temp storage
                 success = self.direct_stream_to_s3(scanner, share_path, s3_key, file_info['size'])
                 
                 if success:
@@ -2406,12 +2614,18 @@ Next Steps:
                 return False
             finally:
                 scanner.disconnect()
+                # Explicitly trigger garbage collection after large file operations
+                import gc
+                gc.collect()
         
-        # For smaller files, use the regular method
+        # For smaller files, use a more memory-efficient upload process
         return self.regular_upload_process(file_info, s3_key)
     
     def regular_upload_process(self, file_info, s3_key):
-        """Regular upload process for normal sized files."""
+        """
+        Memory-efficient upload process for normal sized files.
+        Uses chunked reading and temporary file cleanup.
+        """
         # Initialize variables
         temp_path = None
         scanner = None
@@ -2428,14 +2642,33 @@ Next Steps:
                     logger.error(f"Failed to connect to share {share_config['name']}")
                     return False
                 
-                # Download to temp file
-                temp_path = scanner.get_temp_file(share_path, os.path.basename(share_path))
-                
-                try:
-                    # Upload to S3
-                    success = self.s3_manager.upload_file(temp_path, s3_key)
+                # For files under a certain threshold, use direct streaming
+                # Otherwise, download to temp file and upload
+                if file_info['size'] < 50 * 1024 * 1024:  # 50MB threshold for direct streaming
+                    # Extract share name and path
+                    if ':' in share_path:
+                        share_name, file_path_rel = scanner.extract_share_path(share_path)
+                    else:
+                        share_name = share_config['name']
+                        file_path_rel = share_path
                     
-                    if success:
+                    # Get file data in memory but stream directly to S3
+                    buffer = io.BytesIO()
+                    scanner.conn.retrieveFile(share_name, file_path_rel, buffer)
+                    buffer.seek(0)
+                    
+                    # Upload to S3 directly from memory
+                    try:
+                        # Use the storage_class attribute from config
+                        storage_class = self.config.storage_class
+                        
+                        self.s3_manager.s3_client.upload_fileobj(
+                            buffer,
+                            self.config.s3_bucket,
+                            s3_key,
+                            ExtraArgs={'StorageClass': storage_class}
+                        )
+                        
                         # Update the database - mark as uploaded to S3
                         self.db_manager.add_file(
                             local_path=file_info['local_path'],
@@ -2448,15 +2681,45 @@ Next Steps:
                             file_name=file_info.get('file_name', os.path.basename(share_path)),
                             uploaded_to_s3=1  # Mark as uploaded
                         )
+                        
+                        logger.info(f"Successfully uploaded {file_info['local_path']} to s3://{self.config.s3_bucket}/{s3_key} (direct streaming)")
                         return True
-                    return False
-                finally:
-                    # Clean up temp file
-                    if os.path.exists(temp_path):
-                        try:
-                            os.unlink(temp_path)
-                        except Exception as e:
-                            logger.warning(f"Failed to remove temp file {temp_path}: {e}")
+                    except Exception as e:
+                        logger.error(f"Error uploading file to S3 (direct streaming): {str(e)}")
+                        return False
+                    finally:
+                        # Free memory
+                        buffer.close()
+                else:
+                    # Download to temp file
+                    temp_path = scanner.get_temp_file(share_path, os.path.basename(share_path))
+                    
+                    try:
+                        # Upload to S3
+                        success = self.s3_manager.upload_file(temp_path, s3_key)
+                        
+                        if success:
+                            # Update the database - mark as uploaded to S3
+                            self.db_manager.add_file(
+                                local_path=file_info['local_path'],
+                                s3_path=s3_key,
+                                size=file_info['size'],
+                                last_modified=file_info['last_modified'].isoformat(),
+                                checksum=file_info['checksum'],
+                                previous_path=None,
+                                moved_in_s3=0,
+                                file_name=file_info.get('file_name', os.path.basename(share_path)),
+                                uploaded_to_s3=1  # Mark as uploaded
+                            )
+                            return True
+                        return False
+                    finally:
+                        # Clean up temp file
+                        if os.path.exists(temp_path):
+                            try:
+                                os.unlink(temp_path)
+                            except Exception as e:
+                                logger.warning(f"Failed to remove temp file {temp_path}: {e}")
             finally:
                 scanner.disconnect()
         except Exception as e:
