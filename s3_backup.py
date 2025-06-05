@@ -1085,9 +1085,10 @@ class ShareScanner:
             file_path = file_path.strip().replace('\\', '/')
         
         # Handle paths in format "sharename:/path/to/file.ext"
-        parts = file_path.split(':', 1)
-        if len(parts) == 2:
-            return parts[0], parts[1]
+        if ':' in file_path:
+            parts = file_path.split(':', 1)
+            if len(parts) == 2:
+                return parts[0], parts[1]
         
         # For paths without colon, use the current SMB share name
         if hasattr(self, 'share_config') and self.share_config:
@@ -1235,7 +1236,7 @@ class ShareScanner:
                         
                         # Get file attributes
                         file_attr = self.conn.getAttributes(share_name, file_path_rel)
-                        file_size = file_attr.file_size
+                        file_size = int(file_attr.file_size)  # Ensure it's an integer
                         
                         # Get thresholds from config
                         partial_checksum_threshold = 500 * 1024 * 1024  # 500MB default
@@ -1254,26 +1255,32 @@ class ShareScanner:
                             # Use an efficient sampling approach for large files
                             # Sample beginning of file (first 128KB)
                             begin_buffer = io.BytesIO()
-                            self.conn.retrieveFileFromOffset(share_name, file_path_rel, begin_buffer, 0, 131072)
-                            begin_buffer.seek(0)
-                            begin_data = begin_buffer.read()
-                            begin_buffer.close()  # Explicitly close to free memory
+                            try:
+                                bytes_read = self.conn.retrieveFileFromOffset(share_name, file_path_rel, begin_buffer, 0, 131072)
+                                begin_buffer.seek(0)
+                                begin_data = begin_buffer.read()
+                            finally:
+                                begin_buffer.close()  # Explicitly close to free memory
                             
                             # Sample middle of file (128KB from middle)
                             middle_offset = max(file_size // 2 - 65536, 131072)
                             middle_buffer = io.BytesIO()
-                            self.conn.retrieveFileFromOffset(share_name, file_path_rel, middle_buffer, middle_offset, 131072)
-                            middle_buffer.seek(0)
-                            middle_data = middle_buffer.read()
-                            middle_buffer.close()  # Explicitly close to free memory
+                            try:
+                                bytes_read = self.conn.retrieveFileFromOffset(share_name, file_path_rel, middle_buffer, middle_offset, 131072)
+                                middle_buffer.seek(0)
+                                middle_data = middle_buffer.read()
+                            finally:
+                                middle_buffer.close()  # Explicitly close to free memory
                             
                             # Sample end of file (last 128KB)
                             end_offset = max(file_size - 131072, middle_offset + 131072)
                             end_buffer = io.BytesIO()
-                            self.conn.retrieveFileFromOffset(share_name, file_path_rel, end_buffer, end_offset, 131072)
-                            end_buffer.seek(0)
-                            end_data = end_buffer.read()
-                            end_buffer.close()  # Explicitly close to free memory
+                            try:
+                                bytes_read = self.conn.retrieveFileFromOffset(share_name, file_path_rel, end_buffer, end_offset, 131072)
+                                end_buffer.seek(0)
+                                end_data = end_buffer.read()
+                            finally:
+                                end_buffer.close()  # Explicitly close to free memory
                             
                             # Calculate MD5 of the sampled parts
                             composite_md5 = hashlib.md5()
@@ -1287,7 +1294,7 @@ class ShareScanner:
                             del end_data
                             
                             # Create a composite fingerprint with metadata
-                            fingerprint = f"partial-{file_size}-{file_attr.last_write_time}-{composite_md5.hexdigest()}"
+                            fingerprint = f"partial-{file_size}-{int(file_attr.last_write_time)}-{composite_md5.hexdigest()}"
                             logger.info(f"Generated partial checksum in {time.time() - start_time:.2f} seconds")
                             return fingerprint
                             
@@ -1307,7 +1314,7 @@ class ShareScanner:
                 else:
                     # Determine which strategy based on file size
                     if os.path.exists(file_path):
-                        file_size = os.path.getsize(file_path)
+                        file_size = int(os.path.getsize(file_path))  # Ensure it's an integer
                     else:
                         raise FileNotFoundError(f"Local file not found: {file_path}")
                     
@@ -1351,7 +1358,7 @@ class ShareScanner:
                         
                         # Create fingerprint with metadata
                         mtime = os.path.getmtime(file_path)
-                        fingerprint = f"partial-{file_size}-{mtime}-{composite_md5.hexdigest()}"
+                        fingerprint = f"partial-{file_size}-{int(mtime)}-{composite_md5.hexdigest()}"
                         logger.info(f"Generated partial checksum in {time.time() - start_time:.2f} seconds")
                         return fingerprint
                     
@@ -1404,29 +1411,39 @@ class ShareScanner:
                 # Create a small buffer just for this chunk
                 buffer = io.BytesIO()
                 
-                # Read a chunk from offset
-                bytes_read = self.conn.retrieveFileFromOffset(
-                    share_name, 
-                    file_path_rel, 
-                    buffer, 
-                    offset, 
-                    chunk_size
-                )
-                
-                # If we didn't read anything, we're done
-                if bytes_read == 0:
-                    break
+                try:
+                    # Read a chunk from offset
+                    bytes_read = self.conn.retrieveFileFromOffset(
+                        share_name, 
+                        file_path_rel, 
+                        buffer, 
+                        offset, 
+                        chunk_size
+                    )
                     
-                # Update the hash with this chunk
-                buffer.seek(0)
-                data = buffer.read()
-                md5.update(data)
-                
-                # Move to next chunk
-                offset += bytes_read
-                
-                # Free the buffer memory
-                buffer.close()
+                    # Ensure bytes_read is an integer
+                    if not isinstance(bytes_read, int):
+                        logger.error(f"retrieveFileFromOffset returned non-integer: {type(bytes_read)}")
+                        break
+                    
+                    # If we didn't read anything, we're done
+                    if bytes_read == 0:
+                        break
+                        
+                    # Update the hash with this chunk
+                    buffer.seek(0)
+                    data = buffer.read()
+                    md5.update(data)
+                    
+                    # Move to next chunk - ensure offset remains an integer
+                    offset = int(offset) + int(bytes_read)
+                    
+                except Exception as chunk_error:
+                    logger.error(f"Error reading chunk at offset {offset}: {str(chunk_error)}")
+                    break
+                finally:
+                    # Free the buffer memory
+                    buffer.close()
                 
         except Exception as e:
             logger.error(f"Error in streaming checksum calculation: {str(e)}")
